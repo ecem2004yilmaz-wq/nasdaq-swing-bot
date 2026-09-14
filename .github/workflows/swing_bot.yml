@@ -2,7 +2,12 @@ name: NASDAQ NYSE Swing Bot
 
 on:
   schedule:
-    - cron: "*/5 4-19 * * 1-5"
+    # New York time: 04:00-16:00, Monday-Friday, every 5 minutes.
+    # 04:00-09:25 = pre-market
+    # 09:30-16:00 = regular session
+    - cron: "*/5 4-15 * * 1-5"
+      timezone: "America/New_York"
+    - cron: "0 16 * * 1-5"
       timezone: "America/New_York"
   workflow_dispatch:
 
@@ -11,7 +16,7 @@ permissions:
 
 concurrency:
   group: swing-bot
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   scan:
@@ -20,12 +25,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -45,10 +50,12 @@ jobs:
         run: |
           python main.py --once
 
-      - name: Persist bot database and cache
+      - name: Persist bot state
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git pull --rebase origin main
 
           git add alerts.db
 
@@ -56,5 +63,9 @@ jobs:
             git add nasdaq_tickers.json
           fi
 
-          git diff --cached --quiet || git commit -m "Update bot state"
-          git push
+          if git diff --cached --quiet; then
+            echo "No bot state changes to commit."
+          else
+            git commit -m "Update bot state"
+            git push origin main
+          fi
