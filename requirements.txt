@@ -1,0 +1,4 @@
+requests
+python-dotenv
+APScheduler
+google-genai
