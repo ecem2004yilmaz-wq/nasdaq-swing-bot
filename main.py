@@ -199,6 +199,17 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_swing_symbol ON swing_signals(symbol);
             """)
 
+            # Backward-compatible migration: older versions used a different
+            # counter column in gemini_usage.  SQLite CREATE TABLE IF NOT EXISTS
+            # does not modify an existing table, so add the current column when
+            # necessary and copy any known legacy counter into it.
+            cols = {row[1] for row in c.execute("PRAGMA table_info(gemini_usage)").fetchall()}
+            if "requests" not in cols:
+                c.execute("ALTER TABLE gemini_usage ADD COLUMN requests INTEGER DEFAULT 0")
+                legacy = next((name for name in ("count", "request_count", "total_requests", "usage") if name in cols), None)
+                if legacy:
+                    c.execute(f'UPDATE gemini_usage SET requests = COALESCE("{legacy}", 0)')
+
     def gemini_requests_today(self):
         day = datetime.now(TR).date().isoformat()
         with self.connect() as c:
