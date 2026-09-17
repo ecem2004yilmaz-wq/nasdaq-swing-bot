@@ -4,75 +4,80 @@ import json
 import time
 import sqlite3
 import logging
-import random
 import threading
-import requests
 import concurrent.futures
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import requests
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from google import genai
+
+try:
+    from google import genai
+except Exception:
+    genai = None
 
 # ============================================================
-# ENV / CONFIG
+# CONFIG
 # ============================================================
 load_dotenv()
 
 GEMINI_API_KEYS = [
-    os.getenv("GEMINI_API_KEY_1", ""),
-    os.getenv("GEMINI_API_KEY_2", ""),
+    os.getenv("GEMINI_API_KEY_1", "").strip(),
+    os.getenv("GEMINI_API_KEY_2", "").strip(),
 ]
 GEMINI_API_KEYS = [k for k in GEMINI_API_KEYS if k]
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 DATABASE_PATH = os.getenv("DATABASE_PATH", "alerts.db")
 TICKER_CACHE_FILE = os.getenv("TICKER_CACHE_FILE", "nasdaq_tickers.json")
 
-# Kullanıcının sermayesine uygun tarama aralığı.
 MIN_PRICE = 0.01
 MAX_PRICE = 15.00
 
-# Swing stratejisi: hedef 1 haftaya kadar; çok güçlü yapı varsa 10 güne kadar takip.
-MAX_SIGNAL_DAYS = 10
-NORMAL_SIGNAL_DAYS = 5
+# Candidate discovery. These are deliberately broad; the score decides quality.
+MIN_DOLLAR_VOLUME = 150_000
+MIN_PRICE_DOLLAR_VOLUME = 250_000
+MIN_AVG_DAILY_VOLUME = 50_000
 
-# Sıkı kalite filtreleri.
-MIN_SCORE = 58
-PENNY_MIN_SCORE = 65
+# Signal thresholds
+MIN_SCORE = 62
+STRONG_SCORE = 80
+MOMENTUM_SCORE = 70
 MIN_RVOL = 1.00
-PENNY_MIN_RVOL = 0.50
-MIN_DAILY_CHANGE = 1.0
-MIN_DOLLAR_VOLUME = 200_000
-PENNY_MIN_DOLLAR_VOLUME = 350_000
-MIN_TP1_GAIN = 0.04       # %4
-MIN_TP2_GAIN = 0.08       # %8
-MIN_TP3_GAIN = 0.12       # %12
-MIN_RR = 1.30
+GOOD_RVOL = 1.50
+HIGH_RVOL = 2.50
+MIN_RR = 1.50
+IDEAL_RR = 2.00
 
-# Yahoo screener en fazla 250 sonuç döndürür. Ayrı ön filtreler birleştiriliyor.
+# Signal management
+SIGNAL_COOLDOWN_MINUTES = 30
+COOLDOWN_SCORE_OVERRIDE = 10
+COOLDOWN_RVOL_OVERRIDE = 1.5
+COOLDOWN_MOVE_OVERRIDE = 0.03
+MAX_SIGNAL_DAYS = 10
+NORMAL_EXPECTED_DAYS = "1–5 gün"
+
+# API / scan controls
 SCREENER_COUNT = 250
-DETAILED_CANDIDATES = 100
-MAX_WORKERS = 3
-YAHOO_TIMEOUT = 12
-YAHOO_RETRIES = 3
-YAHOO_BASE_BACKOFF = 1.5
-
-# Açık sinyaller yalnızca kendileri için takip edilir.
-POSITION_CHECK_INTERVAL_MINUTES = 5
-SIGNAL_COOLDOWN_HOURS = 24
-
+DETAILED_CANDIDATES = 120
+MAX_WORKERS = 8
+YAHOO_TIMEOUT = 10
+YAHOO_RETRIES = 2
+YAHOO_BASE_BACKOFF = 1.2
 MAX_GEMINI_DAILY_REQUESTS = 1400
+SCAN_INTERVAL_MINUTES = 5
 
-NY_TZ = ZoneInfo("America/New_York")
-TR_TZ = ZoneInfo("Europe/Istanbul")
-SCAN_LOCK = threading.Lock()
-HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "Mozilla/5.0 (NASDAQ Swing Bot/2.0)"})
+NY = ZoneInfo("America/New_York")
+TR = ZoneInfo("Europe/Istanbul")
+
+SEC_TICKER_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
+YAHOO_SCREENER_URL = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 
 # ============================================================
 # LOGGING
@@ -80,30 +85,65 @@ HTTP.headers.update({"User-Agent": "Mozilla/5.0 (NASDAQ Swing Bot/2.0)"})
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("NASDAQ-SWING-BOT")
+log = logging.getLogger("nasdaq_bot")
+
+# Keep output compact for GitHub Actions / PythonAnywhere storage.
 
 # ============================================================
-# DATABASE
+# HTTP
 # ============================================================
-class DatabaseManager:
-    def __init__(self, db_path):
-        self.db_path = db_path
-        self.init_database()
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "NASDAQ-Swing-Bot/2.0 contact@example.com",
+    "Accept": "application/json,text/plain,*/*",
+})
 
-    def get_connection(self):
-        return sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
+SCAN_LOCK = threading.Lock()
 
-    def init_database(self):
-        conn = self.get_connection()
-        cur = conn.cursor()
 
-        # Eski alerts tablosunu silmiyoruz; mevcut geçmiş korunuyor.
-        cur.execute("""
+def http_get(url, params=None, timeout=YAHOO_TIMEOUT, retries=YAHOO_RETRIES):
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            r = SESSION.get(url, params=params, timeout=timeout)
+            if r.status_code == 200:
+                return r
+            if r.status_code in (429, 500, 502, 503, 504):
+                last_error = RuntimeError(f"HTTP {r.status_code}")
+                time.sleep(YAHOO_BASE_BACKOFF * (attempt + 1))
+                continue
+            r.raise_for_status()
+        except Exception as exc:
+            last_error = exc
+            if attempt < retries:
+                time.sleep(YAHOO_BASE_BACKOFF * (attempt + 1))
+    if last_error:
+        raise last_error
+    raise RuntimeError("HTTP request failed")
+
+# ============================================================
+# DB
+# ============================================================
+class Database:
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.init_db()
+
+    def connect(self):
+        conn = sqlite3.connect(self.path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def init_db(self):
+        with self.connect() as c:
+            c.executescript("""
             CREATE TABLE IF NOT EXISTS alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
+                symbol TEXT,
+                timestamp TEXT,
                 price REAL,
                 score REAL,
                 rvol REAL,
@@ -111,179 +151,150 @@ class DatabaseManager:
                 stop_loss REAL,
                 gemini_decision TEXT,
                 gemini_reason TEXT
-            )
-        """)
+            );
 
-        cur.execute("""
             CREATE TABLE IF NOT EXISTS gemini_usage (
-                date TEXT PRIMARY KEY,
-                request_count INTEGER DEFAULT 0
-            )
-        """)
+                day TEXT PRIMARY KEY,
+                requests INTEGER DEFAULT 0
+            );
 
-        cur.execute("""
             CREATE TABLE IF NOT EXISTS swing_signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                opened_at TEXT NOT NULL,
+                symbol TEXT,
+                opened_at TEXT,
                 closed_at TEXT,
-                status TEXT NOT NULL DEFAULT 'OPEN',
-                entry_price REAL NOT NULL,
+                status TEXT,
+                entry_price REAL,
                 current_price REAL,
-                stop_loss REAL NOT NULL,
-                tp1 REAL NOT NULL,
-                tp2 REAL NOT NULL,
-                tp3 REAL NOT NULL,
+                stop_loss REAL,
+                tp1 REAL,
+                tp2 REAL,
+                tp3 REAL,
                 tp1_hit INTEGER DEFAULT 0,
                 tp2_hit INTEGER DEFAULT 0,
                 tp3_hit INTEGER DEFAULT 0,
-                max_target TEXT DEFAULT 'TP1',
+                max_target REAL,
                 score REAL,
                 rvol REAL,
                 rsi REAL,
                 daily_change REAL,
                 rr REAL,
-                expected_days INTEGER,
+                expected_days TEXT,
                 gemini_status TEXT,
                 gemini_reason TEXT,
                 last_update_at TEXT,
                 last_notified_price REAL
-            )
-        """)
+            );
 
-        cur.execute("""
             CREATE TABLE IF NOT EXISTS signal_updates (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                signal_id INTEGER NOT NULL,
-                timestamp TEXT NOT NULL,
-                event TEXT NOT NULL,
+                signal_id INTEGER,
+                timestamp TEXT,
+                event TEXT,
                 price REAL,
                 note TEXT
-            )
-        """)
+            );
 
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_swing_status ON swing_signals(status)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_swing_symbol ON swing_signals(symbol)")
-        conn.commit()
-        conn.close()
+            CREATE INDEX IF NOT EXISTS idx_swing_status ON swing_signals(status);
+            CREATE INDEX IF NOT EXISTS idx_swing_symbol ON swing_signals(symbol);
+            """)
 
-    def get_gemini_usage(self):
-        today = datetime.now().strftime("%Y-%m-%d")
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT request_count FROM gemini_usage WHERE date = ?", (today,))
-        row = cur.fetchone()
-        conn.close()
-        return int(row[0]) if row else 0
+    def gemini_requests_today(self):
+        day = datetime.now(TR).date().isoformat()
+        with self.connect() as c:
+            row = c.execute("SELECT requests FROM gemini_usage WHERE day=?", (day,)).fetchone()
+            return int(row[0]) if row else 0
 
-    def increment_gemini_usage(self):
-        today = datetime.now().strftime("%Y-%m-%d")
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO gemini_usage(date, request_count)
-            VALUES (?, 1)
-            ON CONFLICT(date)
-            DO UPDATE SET request_count = request_count + 1
-        """, (today,))
-        conn.commit()
-        conn.close()
-
-    def has_recent_signal(self, symbol):
-        cutoff = (datetime.now() - timedelta(hours=SIGNAL_COOLDOWN_HOURS)).isoformat()
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT 1 FROM swing_signals
-            WHERE symbol = ? AND opened_at >= ?
-            ORDER BY id DESC LIMIT 1
-        """, (symbol, cutoff))
-        row = cur.fetchone()
-        conn.close()
-        return row is not None
+    def increment_gemini(self):
+        day = datetime.now(TR).date().isoformat()
+        with self.lock, self.connect() as c:
+            c.execute("""
+                INSERT INTO gemini_usage(day, requests) VALUES(?,1)
+                ON CONFLICT(day) DO UPDATE SET requests=requests+1
+            """, (day,))
 
     def has_open_signal(self, symbol):
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM swing_signals WHERE symbol = ? AND status = 'OPEN' LIMIT 1", (symbol,))
-        row = cur.fetchone()
-        conn.close()
-        return row is not None
+        with self.connect() as c:
+            row = c.execute(
+                "SELECT 1 FROM swing_signals WHERE symbol=? AND status='OPEN' LIMIT 1",
+                (symbol,),
+            ).fetchone()
+            return row is not None
 
-    def create_signal(self, c, gemini_status, gemini_reason):
-        now = datetime.now().isoformat()
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO swing_signals (
-                symbol, opened_at, status, entry_price, current_price,
-                stop_loss, tp1, tp2, tp3, score, rvol, rsi,
-                daily_change, rr, expected_days, max_target,
-                gemini_status, gemini_reason, last_update_at, last_notified_price
-            ) VALUES (?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            c["symbol"], now, c["price"], c["price"], c["stop_loss"],
-            c["tp1"], c["tp2"], c["tp3"], c["score"], c["rvol"], c["rsi"],
-            c["daily_change"], c["rr"], c["expected_days"], c["max_target"],
-            gemini_status, gemini_reason, now, c["price"],
-        ))
-        signal_id = cur.lastrowid
-        cur.execute("""
-            INSERT INTO signal_updates(signal_id, timestamp, event, price, note)
-            VALUES (?, ?, 'OPEN', ?, ?)
-        """, (signal_id, now, c["price"], "Yeni swing sinyali"))
-        conn.commit()
-        conn.close()
-        return signal_id
+    def recent_signal(self, symbol, minutes=SIGNAL_COOLDOWN_MINUTES):
+        cutoff = datetime.now(TR) - timedelta(minutes=minutes)
+        with self.connect() as c:
+            row = c.execute(
+                "SELECT opened_at, score, rvol, entry_price FROM swing_signals "
+                "WHERE symbol=? ORDER BY id DESC LIMIT 1", (symbol,)
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            opened = datetime.fromisoformat(row[0])
+        except Exception:
+            return None
+        if opened.tzinfo is None:
+            opened = opened.replace(tzinfo=TR)
+        if opened < cutoff:
+            return None
+        return dict(row)
+
+    def create_signal(self, data):
+        now = datetime.now(TR).isoformat(timespec="seconds")
+        with self.lock, self.connect() as c:
+            cur = c.execute("""
+                INSERT INTO swing_signals(
+                    symbol, opened_at, status, entry_price, current_price,
+                    stop_loss, tp1, tp2, tp3, max_target, score, rvol, rsi,
+                    daily_change, rr, expected_days, gemini_status,
+                    gemini_reason, last_update_at, last_notified_price
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                data["symbol"], now, "OPEN", data["entry"], data["entry"],
+                data["stop"], data["tp1"], data["tp2"], data["tp3"],
+                data["max_target"], data["score"], data["rvol"], data["rsi"],
+                data["daily_change"], data["rr"], data["expected_days"],
+                data.get("gemini_status", "N/A"), data.get("gemini_reason", ""),
+                now, data["entry"],
+            ))
+            return cur.lastrowid
 
     def get_open_signals(self):
-        conn = self.get_connection()
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM swing_signals WHERE status = 'OPEN' ORDER BY id ASC")
-        rows = [dict(r) for r in cur.fetchall()]
-        conn.close()
-        return rows
+        with self.connect() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM swing_signals WHERE status='OPEN' ORDER BY id"
+            ).fetchall()]
 
     def update_signal(self, signal_id, **fields):
         if not fields:
             return
-        allowed = {
-            "status", "closed_at", "current_price", "tp1_hit", "tp2_hit", "tp3_hit",
-            "last_update_at", "last_notified_price", "stop_loss", "max_target"
-        }
-        fields = {k: v for k, v in fields.items() if k in allowed}
-        if not fields:
-            return
-        fields["last_update_at"] = datetime.now().isoformat()
-        cols = ", ".join(f"{k} = ?" for k in fields)
-        values = list(fields.values()) + [signal_id]
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute(f"UPDATE swing_signals SET {cols} WHERE id = ?", values)
-        conn.commit()
-        conn.close()
+        fields["last_update_at"] = datetime.now(TR).isoformat(timespec="seconds")
+        cols = ", ".join(f"{k}=?" for k in fields)
+        vals = list(fields.values()) + [signal_id]
+        with self.lock, self.connect() as c:
+            c.execute(f"UPDATE swing_signals SET {cols} WHERE id=?", vals)
 
-    def add_update(self, signal_id, event, price, note):
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO signal_updates(signal_id, timestamp, event, price, note)
-            VALUES (?, ?, ?, ?, ?)
-        """, (signal_id, datetime.now().isoformat(), event, price, note))
-        conn.commit()
-        conn.close()
+    def add_update(self, signal_id, event, price, note=""):
+        with self.lock, self.connect() as c:
+            c.execute(
+                "INSERT INTO signal_updates(signal_id,timestamp,event,price,note) VALUES(?,?,?,?,?)",
+                (signal_id, datetime.now(TR).isoformat(timespec="seconds"), event, price, note),
+            )
 
-    def get_signal_opened_at(self, signal_id):
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT opened_at FROM swing_signals WHERE id = ?", (signal_id,))
-        row = cur.fetchone()
-        conn.close()
-        return row[0] if row else None
+    def close_signal(self, signal_id, status, price, note):
+        now = datetime.now(TR).isoformat(timespec="seconds")
+        with self.lock, self.connect() as c:
+            c.execute(
+                "UPDATE swing_signals SET status=?, closed_at=?, current_price=?, last_update_at=? WHERE id=?",
+                (status, now, price, now, signal_id),
+            )
+            c.execute(
+                "INSERT INTO signal_updates(signal_id,timestamp,event,price,note) VALUES(?,?,?,?,?)",
+                (signal_id, now, status, price, note),
+            )
 
-
-db = DatabaseManager(DATABASE_PATH)
+DB = Database(DATABASE_PATH)
 
 # ============================================================
 # TIME / MARKET
@@ -291,216 +302,46 @@ db = DatabaseManager(DATABASE_PATH)
 class TimezoneManager:
     @staticmethod
     def now_ny():
-        return datetime.now(NY_TZ)
+        return datetime.now(NY)
 
     @staticmethod
-    def now_tr():
-        return datetime.now(TR_TZ)
-
-    @staticmethod
-    def get_market_session():
+    def market_session():
         now = TimezoneManager.now_ny()
         if now.weekday() >= 5:
             return "CLOSED"
-        t = now.time()
-        if datetime.strptime("04:00", "%H:%M").time() <= t < datetime.strptime("09:30", "%H:%M").time():
+        t = now.hour * 60 + now.minute
+        if 4 * 60 <= t < 9 * 60 + 30:
             return "PRE_MARKET"
-        if datetime.strptime("09:30", "%H:%M").time() <= t < datetime.strptime("16:00", "%H:%M").time():
+        if 9 * 60 + 30 <= t < 16 * 60:
             return "REGULAR"
-        if datetime.strptime("16:00", "%H:%M").time() <= t < datetime.strptime("20:00", "%H:%M").time():
+        if 16 * 60 <= t < 20 * 60:
             return "AFTER_HOURS"
         return "CLOSED"
 
 # ============================================================
-# UNIVERSE
-# ============================================================
-class UniverseLoader:
-    SEC_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
-
-    @staticmethod
-    def load_universe():
-        if os.path.exists(TICKER_CACHE_FILE):
-            try:
-                age = time.time() - os.path.getmtime(TICKER_CACHE_FILE)
-                if age < 24 * 3600:
-                    with open(TICKER_CACHE_FILE, "r", encoding="utf-8") as f:
-                        tickers = json.load(f)
-                    if len(tickers) >= 500:
-                        return tickers
-            except Exception:
-                pass
-
-        try:
-            r = HTTP.get(UniverseLoader.SEC_URL, timeout=20, headers={"User-Agent": "NASDAQ Swing Bot/2.0 contact: bot@example.com"})
-            r.raise_for_status()
-            rows = r.json().get("data", [])
-            exchanges = {"NASDAQ", "NYSE", "NYSE AMERICAN", "NYSE MKT", "NYSE ARCA"}
-            tickers = []
-            for row in rows:
-                if len(row) < 3:
-                    continue
-                ticker = str(row[1]).upper().strip()
-                exchange = str(row[2]).upper().strip()
-                if exchange in exchanges and ticker and len(ticker) <= 5 and ticker.isalpha():
-                    tickers.append(ticker)
-            tickers = sorted(set(tickers))
-            if len(tickers) < 500:
-                raise RuntimeError(f"Universe çok küçük: {len(tickers)}")
-            with open(TICKER_CACHE_FILE, "w", encoding="utf-8") as f:
-                json.dump(tickers, f)
-            logger.info("Universe hazır: %s NASDAQ/NYSE ticker", len(tickers))
-            return tickers
-        except Exception as e:
-            logger.warning("SEC universe alınamadı: %s", e)
-            return []
-
-# ============================================================
-# YAHOO SCREENER: 4,000+ TICKER'I TEK TEK TARAMAK YERİNE
-# ÖNCE O AN HAREKETLİ OLANLARI BULUR.
-# ============================================================
-SCREENER_URL = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
-CUSTOM_SCREENER_URL = "https://query2.finance.yahoo.com/v1/finance/screener"
-
-
-def _screener_get(params):
-    for attempt in range(YAHOO_RETRIES):
-        try:
-            r = HTTP.get(SCREENER_URL, params=params, timeout=YAHOO_TIMEOUT)
-            if r.status_code == 200:
-                return r.json()
-            if r.status_code in (429, 500, 502, 503, 504) and attempt < YAHOO_RETRIES - 1:
-                time.sleep(min(YAHOO_BASE_BACKOFF * (2 ** attempt) + random.random(), 8))
-                continue
-            logger.warning("Yahoo screener HTTP %s", r.status_code)
-            return None
-        except requests.RequestException as e:
-            if attempt < YAHOO_RETRIES - 1:
-                time.sleep(min(YAHOO_BASE_BACKOFF * (2 ** attempt), 8))
-            else:
-                logger.warning("Yahoo screener request error: %s", e)
-    return None
-
-
-def get_active_universe():
-    """Pre-market + regular-session aday havuzu.
-
-    Yahoo'nun crumb isteyen custom screener endpoint'i kullanılmaz. Bunun yerine
-    public predefined screener listeleri ve pre-market alanları kullanılır.
-    Böylece Invalid Crumb/401 hatası botu bozmaz.
-    """
-    quotes = []
-    scrids = ["small_cap_gainers", "day_gainers", "most_actives"]
-
-    for scr_id in scrids:
-        data = _screener_get({
-            "formatted": "false",
-            "lang": "en-US",
-            "region": "US",
-            "scrIds": scr_id,
-            "count": SCREENER_COUNT,
-            "corsDomain": "finance.yahoo.com",
-        })
-        if data:
-            try:
-                quotes.extend(data["finance"]["result"][0].get("quotes", []))
-            except Exception:
-                pass
-
-    now_ny = TimezoneManager.now_ny()
-    session = TimezoneManager.get_market_session()
-    unique = {}
-
-    for q in quotes:
-        symbol = str(q.get("symbol", "")).upper().strip()
-        if not symbol:
-            continue
-
-        # Pre-market'te güncel fiyat/hacim alanlarını önceliklendir.
-        if session == "PRE_MARKET":
-            price = q.get("preMarketPrice") or q.get("regularMarketPrice") or q.get("intradayPrice")
-            change = q.get("preMarketChangePercent")
-            if change is None:
-                change = q.get("regularMarketChangePercent", q.get("percentChange", 0))
-            volume = q.get("preMarketVolume") or q.get("regularMarketVolume") or q.get("dayVolume", 0)
-        else:
-            price = q.get("regularMarketPrice") or q.get("preMarketPrice") or q.get("intradayPrice")
-            change = q.get("regularMarketChangePercent")
-            if change is None:
-                change = q.get("preMarketChangePercent", q.get("percentChange", 0))
-            volume = q.get("regularMarketVolume") or q.get("dayVolume") or q.get("preMarketVolume", 0)
-
-        avg_volume = q.get("averageDailyVolume3Month", q.get("avgDailyVol3M", 0)) or 0
-        try:
-            price = float(price)
-            change = float(change or 0)
-            volume = float(volume or 0)
-            avg_volume = float(avg_volume or 0)
-        except (TypeError, ValueError):
-            continue
-
-        if not (MIN_PRICE <= price <= MAX_PRICE):
-            continue
-
-        dollar_volume = price * volume
-        min_dollar = PENNY_MIN_DOLLAR_VOLUME if price < 1 else MIN_DOLLAR_VOLUME
-        # Pre-market hacmi regular seansa göre doğal olarak düşüktür.
-        if dollar_volume < min_dollar:
-            continue
-
-        # Regular session'da momentum şartı daha güçlü; pre-market'te %1.5 gap bile
-        # aday havuzuna girebilir, fakat detaylı teknik filtreler son kararı verir.
-        min_change = 0.5 if session == "PRE_MARKET" else MIN_DAILY_CHANGE
-        if change < min_change and (avg_volume <= 0 or volume < avg_volume * 0.50):
-            continue
-
-        rvol = volume / avg_volume if avg_volume > 0 else 0
-        score = 0
-        if change >= 10:
-            score += 30
-        elif change >= 5:
-            score += 22
-        elif change >= 3:
-            score += 16
-        elif change >= min_change:
-            score += 10
-        elif session == "PRE_MARKET" and change >= 0.5:
-            score += 5
-
-        if rvol >= 4:
-            score += 30
-        elif rvol >= 3:
-            score += 26
-        elif rvol >= 2:
-            score += 20
-        elif rvol >= 1.5:
-            score += 14
-        elif rvol >= 1:
-            score += 8
-
-        score += min(20, max(0, int(dollar_volume / 1_000_000 * 5)))
-
-        q = dict(q)
-        q["_bot_price"] = price
-        q["_bot_change"] = change
-        q["_bot_volume"] = volume
-        q["_bot_rvol"] = rvol
-        unique[symbol] = (score, q)
-
-    ordered = [q for _, q in sorted(unique.values(), key=lambda x: x[0], reverse=True)]
-    logger.info("Hızlı screener | %s | %s aktif aday bulundu", session, len(ordered))
-    return ordered
-
-# ============================================================
 # INDICATORS
 # ============================================================
-def ema(values, span):
-    if not values:
+def ema(values, period):
+    if not values or len(values) < period:
         return None
-    alpha = 2 / (span + 1)
-    value = float(values[0])
-    for x in values[1:]:
-        value = alpha * float(x) + (1 - alpha) * value
-    return value
+    k = 2 / (period + 1)
+    out = values[0]
+    for v in values[1:]:
+        out = v * k + out * (1 - k)
+    return out
+
+
+def ema_series(values, period):
+    if len(values) < period:
+        return []
+    k = 2 / (period + 1)
+    out = [None] * (period - 1)
+    current = sum(values[:period]) / period
+    out.append(current)
+    for v in values[period:]:
+        current = v * k + current * (1 - k)
+        out.append(current)
+    return out
 
 
 def rsi(values, period=14):
@@ -508,732 +349,791 @@ def rsi(values, period=14):
         return None
     gains, losses = [], []
     for i in range(1, len(values)):
-        d = float(values[i]) - float(values[i - 1])
+        d = values[i] - values[i - 1]
         gains.append(max(d, 0))
         losses.append(max(-d, 0))
-    ag = sum(gains[-period:]) / period
-    al = sum(losses[-period:]) / period
-    if al == 0:
-        return 100 if ag > 0 else 50
-    return 100 - 100 / (1 + ag / al)
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
 
-def atr(bars, period=14):
-    if len(bars) < period + 1:
+def atr(highs, lows, closes, period=14):
+    if len(closes) < period + 1:
         return None
     trs = []
-    for i in range(1, len(bars)):
-        h = bars[i]["high"]
-        l = bars[i]["low"]
-        pc = bars[i - 1]["close"]
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    for i in range(1, len(closes)):
+        trs.append(max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        ))
     return sum(trs[-period:]) / period
 
 
-def vwap(bars):
-    total_v = sum(max(0, b["volume"]) for b in bars)
-    if total_v <= 0:
-        return sum((b["high"] + b["low"] + b["close"]) / 3 for b in bars) / len(bars)
-    return sum(((b["high"] + b["low"] + b["close"]) / 3) * max(0, b["volume"]) for b in bars) / total_v
+def safe_float(v, default=None):
+    try:
+        x = float(v)
+        if x != x or x in (float("inf"), float("-inf")):
+            return default
+        return x
+    except Exception:
+        return default
 
 # ============================================================
-# YAHOO CHART FETCH
+# YAHOO DATA
 # ============================================================
-def yahoo_chart(symbol, range_value, interval):
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+def yahoo_chart(symbol, range_value="1mo", interval="1h"):
+    url = YAHOO_CHART_URL.format(symbol=symbol)
     params = {
         "range": range_value,
         "interval": interval,
         "includePrePost": "true",
         "events": "div,splits",
+        "includeAdjustedClose": "true",
     }
-    for attempt in range(YAHOO_RETRIES):
-        try:
-            r = HTTP.get(url, params=params, timeout=YAHOO_TIMEOUT)
-            if r.status_code == 200:
-                payload = r.json()
-                result = payload.get("chart", {}).get("result")
-                if not result:
-                    return []
-                data = result[0]
-                ts = data.get("timestamp", [])
-                q = data.get("indicators", {}).get("quote", [{}])[0]
-                arrays = [q.get(k, []) for k in ("open", "high", "low", "close", "volume")]
-                n = min([len(ts)] + [len(a) for a in arrays]) if ts else 0
-                bars = []
-                for i in range(n):
-                    if any(a[i] is None for a in arrays[:4]):
-                        continue
-                    bars.append({
-                        "timestamp": ts[i],
-                        "open": float(arrays[0][i]),
-                        "high": float(arrays[1][i]),
-                        "low": float(arrays[2][i]),
-                        "close": float(arrays[3][i]),
-                        "volume": float(arrays[4][i] or 0),
-                    })
-                return bars
-            if r.status_code in (429, 500, 502, 503, 504) and attempt < YAHOO_RETRIES - 1:
-                time.sleep(min(YAHOO_BASE_BACKOFF * (2 ** attempt) + random.random(), 8))
-                continue
-            return []
-        except Exception:
-            if attempt < YAHOO_RETRIES - 1:
-                time.sleep(min(YAHOO_BASE_BACKOFF * (2 ** attempt), 8))
-    return []
+    r = http_get(url, params=params)
+    data = r.json()
+    result = (data.get("chart", {}).get("result") or [None])[0]
+    if not result:
+        return None
+    ts = result.get("timestamp") or []
+    q = result.get("indicators", {}).get("quote", [{}])[0]
+    adj = result.get("indicators", {}).get("adjclose", [{}])[0]
+    closes = q.get("close", [])
+    opens = q.get("open", [])
+    highs = q.get("high", [])
+    lows = q.get("low", [])
+    volumes = q.get("volume", [])
+    rows = []
+    for i, t in enumerate(ts):
+        if i >= len(closes):
+            continue
+        c = safe_float(closes[i])
+        if c is None:
+            continue
+        rows.append({
+            "ts": int(t),
+            "open": safe_float(opens[i]) if i < len(opens) else None,
+            "high": safe_float(highs[i]) if i < len(highs) else None,
+            "low": safe_float(lows[i]) if i < len(lows) else None,
+            "close": c,
+            "volume": safe_float(volumes[i], 0) if i < len(volumes) else 0,
+            "adjclose": safe_float(adj.get("adjclose", [])[i]) if i < len(adj.get("adjclose", [])) else None,
+        })
+    return rows
 
 # ============================================================
-# SWING ANALYSIS
+# UNIVERSE
+# ============================================================
+class UniverseLoader:
+    ALLOWED_EXCHANGES = {"NASDAQ", "NYSE", "NYSE AMERICAN", "NYSE MKT", "NYSE ARCA"}
+
+    def __init__(self):
+        self.symbols = []
+
+    def load_sec(self):
+        try:
+            r = http_get(SEC_TICKER_URL, timeout=15, retries=2)
+            data = r.json()
+            fields = data.get("fields", [])
+            idx = {name: i for i, name in enumerate(fields)}
+            rows = data.get("data", [])
+            symbols = set()
+            for row in rows:
+                exch = str(row[idx.get("exchange", -1)] if idx.get("exchange", -1) >= 0 else "").upper()
+                ticker = str(row[idx.get("ticker", -1)] if idx.get("ticker", -1) >= 0 else "").upper().strip()
+                if exch in self.ALLOWED_EXCHANGES and 1 <= len(ticker) <= 5 and ticker.isascii():
+                    symbols.add(ticker.replace(".", "-"))
+            if len(symbols) >= 500:
+                self.symbols = sorted(symbols)
+                with open(TICKER_CACHE_FILE, "w", encoding="utf-8") as f:
+                    json.dump({"updated": datetime.now(TR).isoformat(), "symbols": self.symbols}, f)
+                log.info("SEC universe loaded: %d symbols", len(self.symbols))
+                return self.symbols
+        except Exception as e:
+            log.warning("SEC universe update failed: %s", e)
+        return self.load_cache()
+
+    def load_cache(self):
+        try:
+            with open(TICKER_CACHE_FILE, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            symbols = obj.get("symbols", obj if isinstance(obj, list) else [])
+            if len(symbols) >= 500:
+                self.symbols = symbols
+                log.info("Ticker cache loaded: %d symbols", len(symbols))
+                return symbols
+        except Exception as e:
+            log.warning("Ticker cache unavailable: %s", e)
+        return []
+
+# ============================================================
+# BROAD CANDIDATE DISCOVERY
+# ============================================================
+class CandidateScanner:
+    PREDEFINED = [
+        "small_cap_gainers",
+        "day_gainers",
+        "most_actives",
+        "day_losers",
+    ]
+
+    def __init__(self, allowed_symbols):
+        self.allowed = set(allowed_symbols)
+
+    def _screener(self, scr_id):
+        params = {"scrIds": scr_id, "count": SCREENER_COUNT, "start": 0}
+        r = http_get(YAHOO_SCREENER_URL, params=params, timeout=12, retries=2)
+        data = r.json()
+        result = data.get("finance", {}).get("result") or []
+        if not result:
+            return []
+        quotes = result[0].get("quotes") or []
+        return quotes
+
+    def get_active_universe(self):
+        merged = {}
+        for sid in self.PREDEFINED:
+            try:
+                quotes = self._screener(sid)
+                for q in quotes:
+                    sym = str(q.get("symbol", "")).upper()
+                    if sym not in self.allowed:
+                        continue
+                    price = safe_float(q.get("regularMarketPrice"))
+                    pre = safe_float(q.get("preMarketPrice"))
+                    post = safe_float(q.get("postMarketPrice"))
+                    session = TimezoneManager.market_session()
+                    if session == "PRE_MARKET" and pre:
+                        price = pre
+                    elif session == "AFTER_HOURS" and post:
+                        price = post
+                    if price is None or not (MIN_PRICE <= price <= MAX_PRICE):
+                        continue
+                    volume = safe_float(q.get("regularMarketVolume"), 0) or 0
+                    avg_volume = safe_float(q.get("averageDailyVolume3Month"), 0) or 0
+                    change = safe_float(q.get("regularMarketChangePercent"), 0) or 0
+                    dollar = price * max(volume, avg_volume * 0.15)
+                    if avg_volume < MIN_AVG_DAILY_VOLUME and dollar < MIN_DOLLAR_VOLUME:
+                        continue
+                    merged[sym] = {
+                        "symbol": sym,
+                        "price": price,
+                        "volume": volume,
+                        "avg_volume": avg_volume,
+                        "change": change,
+                        "dollar_volume": dollar,
+                    }
+            except Exception as e:
+                log.warning("Yahoo screener %s failed: %s", sid, e)
+
+        candidates = list(merged.values())
+        # Prefer active names but do not demand a large green daily candle.
+        def quick_score(x):
+            s = 0
+            if x["change"] > 0: s += 10
+            if x["change"] >= 3: s += 5
+            if x["volume"] >= x["avg_volume"] * 1.5 > 0: s += 10
+            if x["volume"] >= x["avg_volume"] * 2.5 > 0: s += 10
+            if x["dollar_volume"] >= 1_000_000: s += 10
+            elif x["dollar_volume"] >= 500_000: s += 5
+            return s
+        candidates.sort(key=quick_score, reverse=True)
+        return candidates
+
+# ============================================================
+# TECHNICAL ANALYSIS / BULLISH SCORE
 # ============================================================
 def analyze_swing(symbol, quote):
     try:
-        price = float(quote.get("_bot_price") or quote.get("regularMarketPrice") or quote.get("preMarketPrice") or quote.get("intradayPrice"))
-        day_change = float(quote.get("_bot_change") if quote.get("_bot_change") is not None else (quote.get("regularMarketChangePercent", quote.get("preMarketChangePercent", quote.get("percentChange", 0)))))
-        day_volume = float(quote.get("_bot_volume") or quote.get("regularMarketVolume") or quote.get("preMarketVolume") or quote.get("dayVolume", 0) or 0)
-        avg_volume = float(quote.get("averageDailyVolume3Month", quote.get("avgDailyVol3M", 0)) or 0)
-        market_cap = float(quote.get("marketCap", 0) or 0)
-        bid = float(quote.get("bid", 0) or 0)
-        ask = float(quote.get("ask", 0) or 0)
-    except (TypeError, ValueError):
+        daily = yahoo_chart(symbol, "6mo", "1d")
+        hourly = yahoo_chart(symbol, "2mo", "1h")
+        intraday = yahoo_chart(symbol, "5d", "5m")
+        if not daily or len(daily) < 60 or not hourly or len(hourly) < 30 or not intraday:
+            return None
+
+        d_close = [x["close"] for x in daily]
+        d_high = [x["high"] for x in daily if x["high"] is not None]
+        d_low = [x["low"] for x in daily if x["low"] is not None]
+        d_vol = [x["volume"] for x in daily]
+        price = safe_float(quote.get("price")) or d_close[-1]
+        if not (MIN_PRICE <= price <= MAX_PRICE):
+            return None
+
+        d_ema20_series = ema_series(d_close, 20)
+        d_ema50 = ema(d_close, 50)
+        d_ema20 = d_ema20_series[-1]
+        d_ema20_prev = d_ema20_series[-6] if len(d_ema20_series) >= 6 else None
+        d_rsi = rsi(d_close, 14)
+        d_atr = atr(
+            [x["high"] for x in daily],
+            [x["low"] for x in daily],
+            d_close,
+            14,
+        )
+        if None in (d_ema20, d_ema50, d_rsi, d_atr):
+            return None
+
+        # Current day volume vs previous 20 completed daily bars.
+        prev20 = d_vol[-21:-1] if len(d_vol) >= 21 else d_vol[:-1]
+        avg_prev20 = sum(prev20) / len(prev20) if prev20 else 0
+        day_rvol = (d_vol[-1] / avg_prev20) if avg_prev20 else 0
+
+        # Hourly momentum.
+        h_close = [x["close"] for x in hourly]
+        h_ema9_series = ema_series(h_close, 9)
+        h_ema20_series = ema_series(h_close, 20)
+        h_ema9 = h_ema9_series[-1] if h_ema9_series else None
+        h_ema20 = h_ema20_series[-1] if h_ema20_series else None
+        h_rsi = rsi(h_close, 14)
+        h_momentum = (h_close[-1] / h_close[-5] - 1) if len(h_close) >= 5 and h_close[-5] else 0
+
+        # Intraday: latest closed-ish bar, session VWAP, local volume trend.
+        now_ts = int(time.time())
+        ny_today = datetime.now(NY).date()
+        today_rows = []
+        for x in intraday:
+            dt = datetime.fromtimestamp(x["ts"], NY)
+            if dt.date() == ny_today and dt.hour >= 4 and x["close"] is not None:
+                today_rows.append((dt, x))
+        if not today_rows:
+            today_rows = [(datetime.fromtimestamp(x["ts"], NY), x) for x in intraday[-80:]]
+
+        tp = today_rows
+        pv = 0.0
+        vv = 0.0
+        for _, x in tp:
+            typical = ((x["high"] or x["close"]) + (x["low"] or x["close"]) + x["close"]) / 3
+            vol = x["volume"] or 0
+            pv += typical * vol
+            vv += vol
+        vwap = pv / vv if vv else None
+
+        recent_intraday = [x for _, x in tp]
+        last5 = recent_intraday[-5:] if len(recent_intraday) >= 5 else recent_intraday
+        rising_count = sum(1 for i in range(1, len(last5)) if last5[i]["close"] > last5[i-1]["close"])
+        last3 = recent_intraday[-3:] if len(recent_intraday) >= 3 else recent_intraday
+        last3_rising = sum(1 for i in range(1, len(last3)) if last3[i]["close"] > last3[i-1]["close"]) >= max(1, len(last3)-1)
+        vol_last = [x["volume"] or 0 for x in recent_intraday[-10:]]
+        volume_increasing = len(vol_last) >= 6 and sum(vol_last[-3:]) / 3 > sum(vol_last[:3]) / 3
+
+        # Intraday RVOL: compare latest 5m bar with same-clock historical 5m bars.
+        intraday_rvol = 0.0
+        if len(intraday) >= 100:
+            latest_dt, latest = today_rows[-1]
+            target_minute = latest_dt.hour * 60 + latest_dt.minute
+            same_slot = []
+            for dt, x in [(datetime.fromtimestamp(z["ts"], NY), z) for z in intraday]:
+                if dt.date() == ny_today:
+                    continue
+                minute = dt.hour * 60 + dt.minute
+                if abs(minute - target_minute) <= 5 and x["volume"]:
+                    same_slot.append(x["volume"])
+            if same_slot:
+                base = sum(same_slot[-20:]) / min(20, len(same_slot))
+                if base > 0:
+                    intraday_rvol = (latest["volume"] or 0) / base
+        rvol = max(day_rvol, intraday_rvol, safe_float(quote.get("rvol"), 0) or 0)
+
+        # Resistance / breakout levels from completed daily bars.
+        prev_daily = daily[:-1]
+        resistance5 = max(x["high"] for x in prev_daily[-5:] if x["high"] is not None)
+        resistance20 = max(x["high"] for x in prev_daily[-20:] if x["high"] is not None)
+        high52 = max(d_high[-252:]) if d_high else resistance20
+        near_resistance = resistance20 > 0 and price >= resistance20 * 0.97
+        breakout = price > resistance20
+        distance_to_res = ((resistance20 - price) / price) if price else 999
+
+        # Spread proxy if quote provides bid/ask; otherwise don't reject.
+        bid = safe_float(quote.get("bid"))
+        ask = safe_float(quote.get("ask"))
+        spread_pct = ((ask - bid) / price) if bid and ask and ask >= bid and price else 0
+        if spread_pct > 0.06:
+            return None
+
+        dollar_volume = max(
+            safe_float(quote.get("dollar_volume"), 0) or 0,
+            price * (safe_float(quote.get("volume"), 0) or 0),
+        )
+        if dollar_volume < MIN_DOLLAR_VOLUME and (safe_float(quote.get("avg_volume"), 0) or 0) * price < MIN_DOLLAR_VOLUME:
+            return None
+
+        # Hard rejects: not a clean bullish setup.
+        if d_rsi > 82:
+            return None
+        if h_rsi is not None and h_rsi > 82 and h_momentum < 0:
+            return None
+        if price < d_ema20 * 0.94 and (h_ema9 is None or h_ema9 <= h_ema20):
+            return None
+        if rvol < MIN_RVOL and dollar_volume < MIN_PRICE_DOLLAR_VOLUME:
+            return None
+
+        # ---------------- SCORE ----------------
+        score = 0
+        reasons = []
+
+        if price > d_ema20:
+            score += 10; reasons.append("Price > EMA20")
+        if h_ema9 is not None and h_ema20 is not None and h_ema9 > h_ema20:
+            score += 10; reasons.append("EMA9 > EMA20")
+        if d_ema20_prev is not None and d_ema20 > d_ema20_prev:
+            score += 8; reasons.append("EMA20 yükseliyor")
+        if h_momentum > 0:
+            score += 10; reasons.append("1H momentum pozitif")
+        if 45 <= d_rsi <= 70:
+            score += 10; reasons.append("RSI uygun")
+        elif 70 < d_rsi <= 78:
+            score += 5; reasons.append("RSI güçlü")
+        if rvol >= 1.5:
+            score += 10; reasons.append("RVOL ≥ 1.5")
+        if rvol >= 2.5:
+            score += 8; reasons.append("RVOL ≥ 2.5")
+        if vwap is not None and price >= vwap:
+            score += 10; reasons.append("VWAP üstü")
+        if near_resistance:
+            score += 8; reasons.append("Dirence yakın")
+        if breakout:
+            score += 12; reasons.append("Breakout")
+        if rising_count >= max(2, len(last5) - 2):
+            score += 8; reasons.append("Son mumlar yükseliyor")
+        if last3_rising:
+            score += 3
+        if volume_increasing:
+            score += 8; reasons.append("Hacim artıyor")
+
+        # Small bonus for meaningful liquidity, but do not let liquidity dominate.
+        if dollar_volume >= 1_000_000:
+            score += 4
+        elif dollar_volume >= 500_000:
+            score += 2
+
+        # ---------------- TARGET / STOP ----------------
+        recent_support = min(x["low"] for x in daily[-10:] if x["low"] is not None)
+        atr_stop = price - max(d_atr * 1.0, price * 0.04)
+        structural_stop = recent_support * 0.985
+        stop = max(0.01, min(price * 0.97, max(atr_stop, structural_stop)))
+        risk = price - stop
+        if risk <= 0 or risk / price > 0.25:
+            return None
+
+        # Targets prioritize nearby resistance, then ATR-based extensions.
+        levels = [r for r in (resistance5, resistance20, high52) if r and r > price]
+        if levels:
+            first = min(levels)
+        else:
+            first = price + d_atr * 1.5
+        tp1 = max(price * 1.04, first)
+        tp2 = max(price * 1.08, price + d_atr * 2.2)
+        tp3 = max(price * 1.12, price + d_atr * 3.2)
+
+        # If resistance is too close, don't use it as a tiny TP1.
+        if tp1 <= price * 1.025:
+            tp1 = price + d_atr * 1.2
+        if tp2 <= tp1:
+            tp2 = tp1 + d_atr * 0.8
+        if tp3 <= tp2:
+            tp3 = tp2 + d_atr * 0.8
+
+        rr = (tp2 - price) / risk if risk else 0
+        if rr < MIN_RR:
+            return None
+        if rr >= IDEAL_RR:
+            score += 5
+            reasons.append("RR ≥ 2")
+
+        # Avoid calling weak setups merely because a stock happened to be in a screener.
+        if score < MIN_SCORE:
+            return None
+
+        if score >= STRONG_SCORE:
+            strength = "STRONG MOMENTUM"
+        elif score >= MOMENTUM_SCORE:
+            strength = "BULLISH MOMENTUM"
+        else:
+            strength = "WATCH / EARLY MOMENTUM"
+
+        max_target = tp3
+        if tp3 >= price * 1.35:
+            max_target = price * 1.35
+
+        daily_change = safe_float(quote.get("change"), 0) or 0
+        return {
+            "symbol": symbol,
+            "entry": price,
+            "stop": round(stop, 4),
+            "tp1": round(tp1, 4),
+            "tp2": round(tp2, 4),
+            "tp3": round(tp3, 4),
+            "max_target": round(max_target, 4),
+            "score": round(min(score, 100), 1),
+            "rvol": round(rvol, 2),
+            "rsi": round(d_rsi, 1),
+            "daily_change": round(daily_change, 2),
+            "rr": round(rr, 2),
+            "expected_days": NORMAL_EXPECTED_DAYS,
+            "strength": strength,
+            "vwap": vwap,
+            "vwap_status": "ABOVE" if vwap is not None and price >= vwap else "BELOW",
+            "breakout": breakout,
+            "near_resistance": near_resistance,
+            "volume_increasing": volume_increasing,
+            "dollar_volume": dollar_volume,
+            "reasons": reasons,
+            "session": TimezoneManager.market_session(),
+            "h_momentum": h_momentum,
+        }
+    except Exception as e:
+        log.debug("Analysis failed %s: %s", symbol, e)
         return None
-
-    if not (MIN_PRICE <= price <= MAX_PRICE):
-        return None
-
-    # Günlük geçmiş: swing trendi için asıl veri.
-    daily = yahoo_chart(symbol, "6mo", "1d")
-    if len(daily) < 60:
-        return None
-
-    closes = [b["close"] for b in daily]
-    highs = [b["high"] for b in daily]
-    lows = [b["low"] for b in daily]
-    vols = [b["volume"] for b in daily]
-
-    ema20 = ema(closes[-80:], 20)
-    ema50 = ema(closes[-80:], 50)
-    rsi14 = rsi(closes, 14)
-    atr14 = atr(daily, 14)
-    if None in (ema20, ema50, rsi14, atr14) or atr14 <= 0:
-        return None
-
-    daily_avg_volume = sum(vols[-21:-1]) / max(1, len(vols[-21:-1]))
-    rvol = day_volume / daily_avg_volume if daily_avg_volume > 0 else 0
-    if quote.get("_bot_rvol", 0):
-        rvol = max(rvol, float(quote.get("_bot_rvol", 0)))
-
-    # Son 5/20 seans dirençleri.
-    prior5 = daily[-6:-1]
-    prior20 = daily[-21:-1]
-    resistance1 = max(b["high"] for b in prior5) if prior5 else price
-    resistance2 = max(b["high"] for b in prior20) if prior20 else price
-    high_52w = max(highs[-252:]) if highs else price
-
-    # 1h veri ile yakın dönem trend/momentum teyidi.
-    hourly = yahoo_chart(symbol, "2mo", "1h")
-    if len(hourly) >= 30:
-        h_closes = [b["close"] for b in hourly]
-        h_ema9 = ema(h_closes[-50:], 9)
-        h_ema20 = ema(h_closes[-50:], 20)
-        h_rsi = rsi(h_closes, 14)
-    else:
-        h_ema9 = h_ema20 = h_rsi = None
-
-    # VWAP sadece gün içi teyit; swing kararının tek sebebi değil.
-    intraday = yahoo_chart(symbol, "5d", "5m")
-    today = TimezoneManager.now_ny().date()
-    today_bars = []
-    for b in intraday:
-        dt = datetime.fromtimestamp(b["timestamp"], tz=NY_TZ)
-        if dt.date() == today and dt.time() >= datetime.strptime("04:00", "%H:%M").time():
-            today_bars.append(b)
-    day_vwap = vwap(today_bars) if today_bars else price
-
-    spread_pct = 0.0
-    if bid > 0 and ask >= bid:
-        spread_pct = (ask - bid) / ((ask + bid) / 2) * 100
-
-    dollar_volume = day_volume * price
-    if dollar_volume < (PENNY_MIN_DOLLAR_VOLUME if price < 1 else MIN_DOLLAR_VOLUME):
-        return None
-    session_now = TimezoneManager.get_market_session()
-    rvol_floor = (PENNY_MIN_RVOL if price < 1 else MIN_RVOL)
-    if session_now == "PRE_MARKET":
-        rvol_floor = 0.50 if price < 1 else 0.30
-    if rvol < rvol_floor:
-        return None
-    if rsi14 < 42 or rsi14 > 78:
-        return None
-    # Ana trend korunuyor: fiyat EMA50 üzerinde olmalı veya saatlik momentum
-    # yukarı dönmüş olmalı. EMA20/EMA50 kusursuz hizalanması şart değil.
-    trend_ok = price >= ema50 or (h_ema9 is not None and h_ema20 is not None and h_ema9 > h_ema20)
-    if not trend_ok:
-        return None
-    min_session_change = 0.5 if session_now == "PRE_MARKET" else MIN_DAILY_CHANGE
-    if day_change < min_session_change and price < resistance1 * 0.98:
-        return None
-    if spread_pct > 4.0 and price < 1:
-        return None
-    if spread_pct > 2.5 and price >= 1:
-        return None
-
-    # Hedefleri önce gerçek dirençlerden, yoksa ATR uzatmasından üret.
-    candidates = [x for x in (resistance1, resistance2, high_52w) if x > price * 1.02]
-    candidates = sorted(set(round(x, 6) for x in candidates))
-
-    fallback1 = price + 1.5 * atr14
-    fallback2 = price + 2.5 * atr14
-    fallback3 = price + 4.0 * atr14
-
-    tp1 = candidates[0] if len(candidates) >= 1 else fallback1
-    tp2 = candidates[1] if len(candidates) >= 2 else max(fallback2, tp1 * 1.12)
-    tp3 = candidates[2] if len(candidates) >= 3 else max(fallback3, tp2 * 1.18)
-
-    # Çok yakın dirençleri hedef kabul etmiyoruz.
-    if tp1 < price * (1 + MIN_TP1_GAIN):
-        tp1 = fallback1
-    if tp2 < price * (1 + MIN_TP2_GAIN):
-        tp2 = max(fallback2, tp1 * 1.10)
-    if tp3 < price * (1 + MIN_TP3_GAIN):
-        tp3 = max(fallback3, tp2 * 1.15)
-
-    # Stop: trend desteği / ATR. Stop'u aşırı genişletmiyoruz.
-    recent_support = min(b["low"] for b in daily[-10:])
-    stop_atr = price - 1.5 * atr14
-    stop_support = recent_support * 0.98
-    stop_loss = max(stop_atr, stop_support)
-    if stop_loss >= price:
-        stop_loss = price - 1.5 * atr14
-    if stop_loss <= 0 or stop_loss >= price:
-        return None
-
-    risk = price - stop_loss
-    rr = (tp1 - price) / risk if risk > 0 else 0
-    if rr < MIN_RR:
-        return None
-
-    tp1_gain = tp1 / price - 1
-    tp2_gain = tp2 / price - 1
-    tp3_gain = tp3 / price - 1
-    if tp1_gain < MIN_TP1_GAIN or tp2_gain < MIN_TP2_GAIN or tp3_gain < MIN_TP3_GAIN:
-        return None
-
-    # 100 puanlık swing skoru.
-    score = 0
-    if rvol >= 3:
-        score += 20
-    elif rvol >= 2:
-        score += 16
-    elif rvol >= 1.5:
-        score += 12
-    elif rvol >= 1.0:
-        score += 8
-    elif rvol >= 0.5:
-        score += 5
-
-    if price > ema20 > ema50:
-        score += 20
-    elif price > ema20 and ema20 >= ema50:
-        score += 15
-    elif price >= ema50:
-        score += 8
-
-    if 52 <= rsi14 <= 68:
-        score += 12
-    elif 45 <= rsi14 < 52 or 68 < rsi14 <= 75:
-        score += 6
-
-    if day_change >= 10:
-        score += 15
-    elif day_change >= 5:
-        score += 12
-    elif day_change >= 1.0:
-        score += 8
-    elif day_change >= 0.5:
-        score += 5
-
-    if price >= resistance1 * 0.995:
-        score += 15
-    elif price >= resistance1 * 0.97:
-        score += 10
-
-    if h_ema9 is not None and h_ema20 is not None and h_ema9 > h_ema20:
-        score += 8
-    if h_rsi is not None and 48 <= h_rsi <= 75:
-        score += 5
-
-    if day_vwap and price >= day_vwap:
-        score += 3
-
-    if dollar_volume >= 10_000_000:
-        score += 2
-
-    if price < 1:
-        required_score = PENNY_MIN_SCORE
-    else:
-        required_score = MIN_SCORE
-    if score < required_score:
-        return None
-
-    # ATR tabanlı kaba zaman ufku; kesinlik iddiası değildir.
-    daily_move = max(atr14 / price, 0.02)
-    expected_days = int(max(1, min(MAX_SIGNAL_DAYS, round(tp1_gain / daily_move))))
-    max_target = "TP3" if tp3_gain >= 0.35 else ("TP2" if tp2_gain >= 0.20 else "TP1")
-
-    return {
-        "symbol": symbol,
-        "price": round(price, 4),
-        "score": int(score),
-        "rvol": round(rvol, 2),
-        "rsi": round(rsi14, 2),
-        "daily_change": round(day_change, 2),
-        "ema20": round(ema20, 4),
-        "ema50": round(ema50, 4),
-        "h_ema9": round(h_ema9, 4) if h_ema9 else None,
-        "h_ema20": round(h_ema20, 4) if h_ema20 else None,
-        "h_rsi": round(h_rsi, 2) if h_rsi else None,
-        "vwap": round(day_vwap, 4) if day_vwap else None,
-        "atr": round(atr14, 4),
-        "resistance1": round(resistance1, 4),
-        "resistance2": round(resistance2, 4),
-        "high_52w": round(high_52w, 4),
-        "spread_pct": round(spread_pct, 2),
-        "dollar_volume": round(dollar_volume, 2),
-        "stop_loss": round(stop_loss, 4),
-        "tp1": round(tp1, 4),
-        "tp2": round(tp2, 4),
-        "tp3": round(tp3, 4),
-        "tp1_gain": round(tp1_gain * 100, 2),
-        "tp2_gain": round(tp2_gain * 100, 2),
-        "tp3_gain": round(tp3_gain * 100, 2),
-        "rr": round(rr, 2),
-        "expected_days": expected_days,
-        "max_target": max_target,
-        "session": TimezoneManager.get_market_session(),
-    }
-
-# ============================================================
-# DETAIL FETCH
-# ============================================================
-def detailed_scan(quotes):
-    # Ön skor ile en fazla 60 sembolü pahalı 6mo/1h/5m analizine sokuyoruz.
-    def quick_key(q):
-        try:
-            price = float(q.get("regularMarketPrice", q.get("intradayPrice")) or 0)
-            change = float(q.get("regularMarketChangePercent", q.get("percentChange", 0)) or 0)
-            volume = float(q.get("regularMarketVolume", q.get("dayVolume", 0)) or 0)
-            avg = float(q.get("averageDailyVolume3Month", q.get("avgDailyVol3M", 0)) or 0)
-            rv = volume / avg if avg > 0 else 0
-            return (rv * 20 + change * 5 + min(volume * price / 1e6, 20))
-        except Exception:
-            return 0
-
-    quotes = sorted(quotes, key=quick_key, reverse=True)[:DETAILED_CANDIDATES]
-    logger.info("Detaylı swing analizi: %s ticker", len(quotes))
-
-    results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {}
-        for q in quotes:
-            symbol = str(q.get("symbol", "")).upper()
-            futures[executor.submit(analyze_swing, symbol, q)] = symbol
-        for future in concurrent.futures.as_completed(futures):
-            symbol = futures[future]
-            try:
-                result = future.result()
-                if result:
-                    results.append(result)
-            except Exception as e:
-                logger.debug("%s detail error: %s", symbol, e)
-
-    results.sort(key=lambda x: (x["score"], x["rr"], x["tp1_gain"]), reverse=True)
-    logger.info("Swing teknik filtreden geçen: %s", len(results))
-    return results
 
 # ============================================================
 # GEMINI
 # ============================================================
 class GeminiEvaluator:
-    def __init__(self, api_keys):
-        self.api_keys = api_keys
+    def __init__(self, keys):
+        self.keys = keys
+        self.index = 0
+
+    def _client(self, key):
+        if genai is None:
+            return None
+        return genai.Client(api_key=key)
 
     def evaluate(self, candidates):
         if not candidates:
-            return {}, "NO_CANDIDATES"
-        if not self.api_keys:
-            return {}, "NO_API_KEY"
-        if db.get_gemini_usage() >= MAX_GEMINI_DAILY_REQUESTS:
-            return {}, "LIMIT"
+            return {}
+        if not self.keys:
+            return {c["symbol"]: {"decision": "WATCH", "reason": "Gemini anahtarı yok; teknik skor kullanıldı."} for c in candidates}
+        if DB.gemini_requests_today() >= MAX_GEMINI_DAILY_REQUESTS:
+            return {c["symbol"]: {"decision": "WATCH", "reason": "Gemini günlük limitine ulaşıldı; teknik skor kullanıldı."} for c in candidates}
 
-        selected = candidates[:5]
-        prompt = (
-            "You are a strict US stock swing-trading screener.\n"
-            "The holding horizon is usually 1-5 trading days, with an absolute tracking horizon up to 10 days.\n"
-            "Do NOT promise or claim certainty.\n"
-            "For EACH ticker choose exactly BUY, WATCH, or PASS.\n"
-            "Prefer strong trend, volume confirmation, breakout/near-breakout, healthy RSI, liquidity, and realistic TP1/TP2/TP3.\n"
-            "Reject weak liquidity, excessive spread, exhausted momentum, or unrealistic targets.\n"
-            "Return ONLY valid JSON, no markdown and no code fences, in this exact shape: "
-            "[{\"symbol\":\"ABC\",\"decision\":\"BUY\",\"reason\":\"short Turkish reason\"}]\n\n"
-        )
-        for c in selected:
-            prompt += json.dumps(c, ensure_ascii=False) + "\n"
+        batch = candidates[:8]
+        compact = []
+        for c in batch:
+            compact.append({
+                "symbol": c["symbol"],
+                "price": round(c["entry"], 4),
+                "score": c["score"],
+                "rvol": c["rvol"],
+                "rsi": c["rsi"],
+                "rr": c["rr"],
+                "daily_change": c["daily_change"],
+                "vwap": c["vwap_status"],
+                "breakout": c["breakout"],
+                "volume_increasing": c["volume_increasing"],
+                "reasons": c["reasons"][:8],
+            })
+        prompt = """
+You are a neutral technical screener assisting a short-term US stock alert bot.
+Evaluate only the supplied candidates. Do not invent news or fundamentals.
+Focus on whether the technical setup has short-term bullish momentum for roughly 1-5 trading days.
+Return ONLY valid JSON as an array. Each item must be:
+{"symbol":"XYZ","decision":"BUY|WATCH|PASS","reason":"short Turkish reason"}
+BUY = technically coherent bullish setup.
+WATCH = mixed but potentially developing.
+PASS = clearly weak/contradictory setup.
+Do not use price prediction certainty and do not guarantee gains.
+Candidates:
+""" + json.dumps(compact, ensure_ascii=False)
 
-        for key in self.api_keys:
+        for _ in range(len(self.keys)):
+            key = self.keys[self.index % len(self.keys)]
+            self.index += 1
             try:
-                client = genai.Client(api_key=key)
+                client = self._client(key)
+                if client is None:
+                    break
                 response = client.models.generate_content(
-                    model="gemini-3.6-flash",
+                    model=GEMINI_MODEL,
                     contents=prompt,
                 )
-                text = getattr(response, "text", None)
-                if not text:
-                    continue
-
-                db.increment_gemini_usage()
-                cleaned = text.strip()
-                if cleaned.startswith("```"):
-                    cleaned = cleaned.replace("```json", "", 1).replace("```", "").strip()
-
-                try:
-                    data = json.loads(cleaned)
-                    if isinstance(data, list):
-                        blocks = {}
-                        for item in data:
-                            if not isinstance(item, dict):
-                                continue
-                            symbol = str(item.get("symbol", "")).upper().strip()
-                            decision = str(item.get("decision", "WATCH")).upper().strip()
-                            reason = str(item.get("reason", "")).strip()
-                            if symbol:
-                                blocks[symbol] = {
-                                    "decision": decision if decision in {"BUY", "WATCH", "PASS"} else "WATCH",
-                                    "reason": reason,
-                                }
-                        if blocks:
-                            return blocks, "OK"
-                except Exception:
-                    pass
-
-                # JSON parse edilemezse teknik adayları kaybetmeyiz; ham Gemini metnini gösteririz.
-                return {c["symbol"]: {"decision": "WATCH", "reason": text.strip()[:700]} for c in selected}, "OK_RAW"
+                DB.increment_gemini()
+                text = (getattr(response, "text", "") or "").strip()
+                if text.startswith("```"):
+                    text = text.replace("```json", "").replace("```", "").strip()
+                parsed = json.loads(text)
+                out = {}
+                for item in parsed:
+                    sym = str(item.get("symbol", "")).upper()
+                    decision = str(item.get("decision", "WATCH")).upper()
+                    if decision not in {"BUY", "WATCH", "PASS"}:
+                        decision = "WATCH"
+                    out[sym] = {"decision": decision, "reason": str(item.get("reason", ""))[:300]}
+                return out
             except Exception as e:
-                logger.warning("Gemini API error: %s", e)
-        return {}, "ERROR"
+                log.warning("Gemini attempt failed: %s", e)
+                continue
+        return {c["symbol"]: {"decision": "WATCH", "reason": "Gemini yanıtı alınamadı; teknik skor kullanıldı."} for c in candidates}
 
-
-gemini = GeminiEvaluator(GEMINI_API_KEYS)
+GEMINI = GeminiEvaluator(GEMINI_API_KEYS)
 
 # ============================================================
 # TELEGRAM
 # ============================================================
-def send_telegram_message(message):
+def send_telegram_message(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram env eksik")
+        log.warning("Telegram ENV eksik; mesaj gönderilmedi.")
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        r = HTTP.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=10)
-        if r.status_code != 200:
-            logger.warning("Telegram HTTP %s: %s", r.status_code, r.text[:300])
-            return False
-        return True
+        r = requests.post(
+            url,
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            return True
+        log.warning("Telegram error %s: %s", r.status_code, r.text[:200])
     except Exception as e:
-        logger.warning("Telegram error: %s", e)
-        return False
+        log.warning("Telegram failed: %s", e)
+    return False
 
 
-def gemini_for_symbol(gemini_blocks, symbol):
-    item = gemini_blocks.get(symbol)
-    if not item:
-        return "🤖 Gemini: analiz alınamadı."
-    return f"🤖 Gemini: {item['decision']} — {item['reason']}"
-
-
-def build_open_message(c, gemini_text):
+def build_open_message(c):
+    breakout_text = "BROKE RESISTANCE" if c["breakout"] else ("NEAR RESISTANCE" if c["near_resistance"] else "NO BREAKOUT")
+    vol_text = "INCREASING" if c["volume_increasing"] else "NORMAL"
+    gem = c.get("gemini_reason", "")
     return (
-        "🎯 NASDAQ SWING SIGNAL\n\n"
+        "🚀 NASDAQ SWING ALERT\n\n"
         f"📌 {c['symbol']}\n"
-        "🟢 LONG\n\n"
-        f"💵 Giriş: ${c['price']:.4f}\n"
-        f"🛑 Stop: ${c['stop_loss']:.4f}\n\n"
-        f"🎯 TP1: ${c['tp1']:.4f}  (+{c['tp1_gain']:.1f}%)\n"
-        f"🎯 TP2: ${c['tp2']:.4f}  (+{c['tp2_gain']:.1f}%)\n"
-        f"🎯 TP3: ${c['tp3']:.4f}  (+{c['tp3_gain']:.1f}%)\n\n"
-        f"📊 Score: {c['score']}/100\n"
+        "🟢 LONG\n"
+        f"💵 Entry: ${c['entry']:.4f}\n\n"
+        f"🟢 {c['strength']}\n"
+        f"⭐ Score: {c['score']:.0f}/100\n\n"
+        f"📈 EMA Trend: {('BULLISH' if 'EMA9 > EMA20' in c['reasons'] else 'MIXED')}\n"
+        f"📊 RSI: {c['rsi']:.1f}\n"
         f"🔥 RVOL: {c['rvol']:.2f}\n"
-        f"📈 RSI: {c['rsi']:.1f}\n"
-        f"📈 Günlük: {c['daily_change']:+.2f}%\n"
-        f"⚖️ RR (TP1): {c['rr']:.2f}\n"
-        f"⏳ Beklenen: {c['expected_days']} gün\n"
-        f"🏁 Maksimum hedef: {c['max_target']}\n\n"
-        f"{gemini_text}\n\n"
+        f"📍 VWAP: {c['vwap_status']}\n"
+        f"🚀 Breakout: {breakout_text}\n"
+        f"💰 Volume: {vol_text}\n\n"
+        f"🎯 TP1: ${c['tp1']:.4f}\n"
+        f"🎯 TP2: ${c['tp2']:.4f}\n"
+        f"🎯 TP3: ${c['tp3']:.4f}\n\n"
+        f"🛑 Stop: ${c['stop']:.4f}\n"
+        f"⚖️ RR: {c['rr']:.2f}\n\n"
+        f"⏱ Beklenen süre: {c['expected_days']}\n"
+        f"📈 Günlük: {c['daily_change']:+.2f}%\n\n"
+        f"🤖 Gemini: {gem or 'Teknik skor baz alındı.'}\n\n"
         "🟢 Durum: AKTİF"
     )
 
-# ============================================================
-# OPEN SIGNAL TRACKER
-# ============================================================
-def fetch_current_price(symbol):
-    # Takipteki açık sinyaller az olduğu için tek sembol chart çağrısı yeterli.
-    bars = yahoo_chart(symbol, "1d", "5m")
-    if not bars:
-        return None
-    return bars[-1]["close"]
 
+def build_update_message(s, event, price, note=""):
+    return (
+        f"📢 SIGNAL UPDATE\n\n"
+        f"📌 {s['symbol']}\n"
+        f"💵 Fiyat: ${price:.4f}\n"
+        f"🔔 {event}\n"
+        f"{note}\n"
+        f"🟢 Durum: {'AKTİF' if event not in ('STOP', 'TP3', 'CLOSED') else 'KAPANDI'}"
+    )
 
-def human_age(opened_at):
+# ============================================================
+# SIGNAL TRACKER
+# ============================================================
+def current_price(symbol):
     try:
-        dt = datetime.fromisoformat(opened_at)
-        delta = datetime.now() - dt
-        days = delta.days
-        hours = delta.seconds // 3600
-        if days:
-            return f"{days} gün {hours} saat"
-        return f"{hours} saat"
+        rows = yahoo_chart(symbol, "1d", "5m")
+        if rows:
+            return rows[-1]["close"]
     except Exception:
-        return "-"
+        pass
+    return None
 
 
 def track_open_signals():
-    signals = db.get_open_signals()
-    if not signals:
+    opens = DB.get_open_signals()
+    if not opens:
         return
-
-    logger.info("Açık swing sinyali takibi: %s", len(signals))
-    for s in signals:
-        price = fetch_current_price(s["symbol"])
+    for s in opens:
+        price = current_price(s["symbol"])
         if price is None:
             continue
 
-        entry = s["entry_price"]
-        tp1, tp2, tp3 = s["tp1"], s["tp2"], s["tp3"]
-        stop = s["stop_loss"]
-        age = human_age(s["opened_at"])
-        gain = (price / entry - 1) * 100
+        opened = datetime.fromisoformat(s["opened_at"])
+        if opened.tzinfo is None:
+            opened = opened.replace(tzinfo=TR)
+        age_days = (datetime.now(TR) - opened).total_seconds() / 86400
 
-        # Stop önce kontrol edilir; aynı bar içinde TP/SL ikisi birden görülürse
-        # muhafazakar tarafta stop'u önce kabul ediyoruz.
-        if price <= stop:
-            db.update_signal(s["id"], status="STOPPED", closed_at=datetime.now().isoformat(), current_price=price)
-            db.add_update(s["id"], "STOP", price, f"Sonuç: {gain:+.2f}%")
-            send_telegram_message(
-                "🛑 STOP\n\n"
-                f"📌 {s['symbol']}\n"
-                f"Giriş: ${entry:.4f}\n"
-                f"Stop: ${stop:.4f}\n\n"
-                f"📉 Sonuç: {gain:+.2f}%\n"
-                f"⏱ Süre: {age}\n\n"
-                "❌ Sinyal kapandı."
-            )
+        # Stop first: a bar that crosses both a target and stop is treated conservatively.
+        if price <= s["stop_loss"]:
+            DB.close_signal(s["id"], "STOP", price, "Stop seviyesi görüldü.")
+            send_telegram_message(build_update_message(s, "STOP", price, "🛑 Stop çalıştı."))
             continue
 
-        event = None
-        if not s["tp1_hit"] and price >= tp1:
-            event = "TP1"
-            db.update_signal(s["id"], tp1_hit=1, current_price=price, stop_loss=entry)
-            db.add_update(s["id"], "TP1", price, f"Kazanç: {gain:+.2f}%")
-            send_telegram_message(
-                "🎯 TP1 VURULDU\n\n"
-                f"📌 {s['symbol']}\n"
-                f"Giriş: ${entry:.4f}\n"
-                f"TP1: ${tp1:.4f} ✅\n\n"
-                f"📈 Kazanç: {gain:+.2f}%\n"
-                f"⏱ Süre: {age}\n\n"
-                f"🎯 TP2: ${tp2:.4f}\n"
-                f"🎯 TP3: ${tp3:.4f}\n\n"
-                "🟢 Sinyal hâlâ aktif. Stop giriş fiyatına çekildi."
-            )
+        if not s["tp1_hit"] and price >= s["tp1"]:
+            DB.update_signal(s["id"], tp1_hit=1, stop_loss=s["entry_price"], current_price=price)
+            DB.add_update(s["id"], "TP1", price, "TP1 görüldü; stop giriş fiyatına taşındı.")
+            send_telegram_message(build_update_message(s, "TP1", price, "🎯 TP1 görüldü. Stop → giriş."))
             s["tp1_hit"] = 1
-            s["stop_loss"] = entry
+            s["stop_loss"] = s["entry_price"]
 
-        if s["tp1_hit"] and not s["tp2_hit"] and price >= tp2:
-            event = "TP2"
-            db.update_signal(s["id"], tp2_hit=1, current_price=price, stop_loss=tp1)
-            db.add_update(s["id"], "TP2", price, f"Kazanç: {gain:+.2f}%")
-            send_telegram_message(
-                "🔥 TP2 VURULDU\n\n"
-                f"📌 {s['symbol']}\n"
-                "TP1: ✅\n"
-                "TP2: ✅\n"
-                "TP3: ⏳\n\n"
-                f"📈 Güncel kazanç: {gain:+.2f}%\n"
-                f"⏱ Süre: {age}\n\n"
-                f"🛡 Yeni stop: ${tp1:.4f}\n"
-                f"🎯 Maksimum hedef: ${tp3:.4f}"
-            )
+        if s["tp1_hit"] and not s["tp2_hit"] and price >= s["tp2"]:
+            DB.update_signal(s["id"], tp2_hit=1, stop_loss=s["tp1"], current_price=price)
+            DB.add_update(s["id"], "TP2", price, "TP2 görüldü; stop TP1'e taşındı.")
+            send_telegram_message(build_update_message(s, "TP2", price, "🎯 TP2 görüldü. Stop → TP1."))
             s["tp2_hit"] = 1
-            s["stop_loss"] = tp1
+            s["stop_loss"] = s["tp1"]
 
-        if s["tp2_hit"] and not s["tp3_hit"] and price >= tp3:
-            db.update_signal(s["id"], tp3_hit=1, status="CLOSED", closed_at=datetime.now().isoformat(), current_price=price)
-            db.add_update(s["id"], "TP3", price, f"Sonuç: {gain:+.2f}%")
-            send_telegram_message(
-                "🏆 TP3 VURULDU\n\n"
-                f"📌 {s['symbol']}\n"
-                "TP1: ✅\nTP2: ✅\nTP3: ✅\n\n"
-                f"📈 Sonuç: {gain:+.2f}%\n"
-                f"⏱ Süre: {age}\n\n"
-                "🟢 SİNYAL BAŞARIYLA TAMAMLANDI"
-            )
+        if price >= s["tp3"]:
+            DB.close_signal(s["id"], "TP3", price, "TP3 görüldü; sinyal kapandı.")
+            send_telegram_message(build_update_message(s, "TP3", price, "🎯 TP3 görüldü. Sinyal kapandı."))
             continue
 
-        # TP1/TP2 gerçekleşmedi ama sinyal 10 günü doldurduysa kapat.
-        try:
-            opened = datetime.fromisoformat(s["opened_at"])
-            if datetime.now() - opened >= timedelta(days=MAX_SIGNAL_DAYS):
-                db.update_signal(s["id"], status="EXPIRED", closed_at=datetime.now().isoformat(), current_price=price)
-                db.add_update(s["id"], "EXPIRED", price, f"10 gün doldu. Sonuç: {gain:+.2f}%")
-                send_telegram_message(
-                    "⏰ SİNYAL SÜRESİ DOLDU\n\n"
-                    f"📌 {s['symbol']}\n"
-                    f"Giriş: ${entry:.4f}\n"
-                    f"Son fiyat: ${price:.4f}\n\n"
-                    f"📊 Sonuç: {gain:+.2f}%\n"
-                    "Sinyal kapatıldı."
-                )
-                continue
-        except Exception:
-            pass
+        if age_days >= MAX_SIGNAL_DAYS:
+            DB.close_signal(s["id"], "CLOSED", price, "10 günlük maksimum süre doldu.")
+            send_telegram_message(build_update_message(s, "CLOSED", price, "⏱ Maksimum 10 gün doldu."))
+            continue
 
-        # Her 5 dakikada fiyat mesajı spamlamıyoruz; yalnızca TP/SL/expire olaylarında haber veriyoruz.
-        if event is None:
-            conn = db.get_connection()
-            cur = conn.cursor()
-            cur.execute("UPDATE swing_signals SET current_price = ? WHERE id = ?", (price, s["id"]))
-            conn.commit()
-            conn.close()
+        DB.update_signal(s["id"], current_price=price)
 
 # ============================================================
-# MARKET PIPELINE
+# PIPELINE
 # ============================================================
+def cooldown_allows(symbol, candidate):
+    if DB.has_open_signal(symbol):
+        return False
+    recent = DB.recent_signal(symbol)
+    if not recent:
+        return True
+    old_score = safe_float(recent.get("score"), 0) or 0
+    old_rvol = safe_float(recent.get("rvol"), 0) or 0
+    old_entry = safe_float(recent.get("entry_price"), 0) or 0
+    new_score = candidate["score"]
+    new_rvol = candidate["rvol"]
+    new_entry = candidate["entry"]
+    move = abs(new_entry - old_entry) / old_entry if old_entry else 0
+    if new_score - old_score >= COOLDOWN_SCORE_OVERRIDE:
+        return True
+    if new_rvol - old_rvol >= COOLDOWN_RVOL_OVERRIDE:
+        return True
+    if move >= COOLDOWN_MOVE_OVERRIDE:
+        return True
+    return False
+
+
 def run_market_pipeline():
     if not SCAN_LOCK.acquire(blocking=False):
-        logger.warning("Önceki scan hâlâ çalışıyor; yeni scan atlandı.")
+        log.info("Önceki tarama hâlâ çalışıyor; bu tur atlandı.")
         return
     try:
-        session = TimezoneManager.get_market_session()
+        session = TimezoneManager.market_session()
         if session == "CLOSED":
             return
 
-        # Önce açık pozisyonları takip et. Bu kısım yalnızca açık sinyal kadar istek atar.
         track_open_signals()
 
-        logger.info("==================================================")
-        logger.info("SWING PIPELINE | %s | NY=%s | TR=%s", session,
-                    TimezoneManager.now_ny().strftime("%Y-%m-%d %H:%M:%S"),
-                    TimezoneManager.now_tr().strftime("%Y-%m-%d %H:%M:%S"))
-
-        quotes = get_active_universe()
-        if not quotes:
-            logger.info("Aktif screener adayı bulunamadı.")
+        loader = UniverseLoader()
+        allowed = loader.symbols or loader.load_sec()
+        if len(allowed) < 500:
+            log.warning("Universe <500 (%d). Fallback yok; tarama durduruldu.", len(allowed))
             return
 
-        candidates = detailed_scan(quotes)
-        if not candidates:
-            logger.info("❌ Sıkı swing filtresinden geçen hisse yok.")
+        scanner = CandidateScanner(allowed)
+        quick = scanner.get_active_universe()
+        if not quick:
+            log.info("Broad screener bu tur aday döndürmedi.")
             return
 
-        # Aynı sembol için açık veya çok yeni sinyal varsa tekrar yollama.
-        final = []
-        for c in candidates:
-            if db.has_open_signal(c["symbol"]):
-                continue
-            if db.has_recent_signal(c["symbol"]):
-                continue
-            final.append(c)
+        quick = quick[:DETAILED_CANDIDATES]
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = [ex.submit(analyze_swing, q["symbol"], q) for q in quick]
+            for f in concurrent.futures.as_completed(futures):
+                try:
+                    item = f.result()
+                    if item:
+                        results.append(item)
+                except Exception:
+                    pass
 
-        final = final[:5]
-        logger.info("Final swing adayları: %s", len(final))
-        if not final:
+        if not results:
+            log.info("Detaylı teknik taramada uygun aday çıkmadı.")
             return
 
-        gemini_blocks, gemini_status = gemini.evaluate(final)
+        results.sort(key=lambda x: (x["score"], x["rr"], x["rvol"]), reverse=True)
+        eligible = [r for r in results if cooldown_allows(r["symbol"], r)]
+        if not eligible:
+            log.info("Adaylar bulundu ancak açık/soğuma filtresinden geçmedi.")
+            return
 
-        # Gemini BUY olmayanları ana sinyalden çıkarıyoruz; API çalışmıyorsa teknik skorun
-        # güçlü adaylarını yine kaybetmemek için API hata/limit durumunda teknik sonuç kullanılır.
-        selected = []
-        for c in final:
-            gitem = gemini_blocks.get(c["symbol"], {})
-            decision = str(gitem.get("decision", "WATCH")).upper()
-            if gemini_status == "OK" and decision == "PASS":
+        top = eligible[:8]
+        gemini = GEMINI.evaluate(top)
+
+        sent = 0
+        for c in top:
+            g = gemini.get(c["symbol"], {"decision": "WATCH", "reason": ""})
+            decision = g.get("decision", "WATCH")
+            # Gemini PASS rejects; WATCH does not erase a strong technical setup.
+            if decision == "PASS":
                 continue
-            selected.append((c, gemini_for_symbol(gemini_blocks, c["symbol"])))
+            c["gemini_status"] = decision
+            c["gemini_reason"] = g.get("reason", "")[:300]
+            msg = build_open_message(c)
+            if send_telegram_message(msg):
+                DB.create_signal(c)
+                DB.add_update(DB.get_open_signals()[-1]["id"], "OPEN", c["entry"], "Yeni sinyal açıldı.")
+                sent += 1
+                if sent >= 5:
+                    break
 
-        for c, gtext in selected:
-            message = build_open_message(c, gtext)
-            if send_telegram_message(message):
-                signal_id = db.create_signal(c, gemini_status, gtext)
-                logger.info("Telegram OPEN gönderildi: %s | signal_id=%s", c["symbol"], signal_id)
-
-        logger.info("SWING PIPELINE bitti. Gönderilen=%s", len(selected))
-    except Exception as e:
-        logger.exception("SWING PIPELINE ERROR: %s", e)
+        log.info(
+            "Tarama tamamlandı | session=%s quick=%d detailed=%d eligible=%d sent=%d",
+            session, len(quick), len(results), len(eligible), sent
+        )
     finally:
         SCAN_LOCK.release()
 
 # ============================================================
 # SCHEDULER
 # ============================================================
-def start_scheduler():
-    scheduler = BackgroundScheduler(
-        timezone=NY_TZ,
-        job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 60},
-    )
+def run_once():
+    run_market_pipeline()
 
-    # Pre-market + regular session: 04:00-16:00 NY, her 5 dakikada bir.
-    # After-hours taraması özellikle istenmediği için 16:00'da durur.
+
+def run_daemon():
+    scheduler = BackgroundScheduler(timezone=NY)
+    # Premarket + regular market: every 5 minutes.
     scheduler.add_job(
         run_market_pipeline,
-        CronTrigger(day_of_week="mon-fri", hour="4-15", minute="*/5"),
-        id="swing_scan_premarket_regular",
-        replace_existing=True,
+        CronTrigger(day_of_week="mon-fri", hour="4-15", minute="*/5", timezone=NY),
+        id="market_scan",
+        max_instances=1,
+        coalesce=True,
     )
+    # One after-hours scan at 16:00 NY.
     scheduler.add_job(
         run_market_pipeline,
-        CronTrigger(day_of_week="mon-fri", hour="16", minute="0"),
-        id="swing_scan_close",
-        replace_existing=True,
+        CronTrigger(day_of_week="mon-fri", hour="16", minute="0", timezone=NY),
+        id="after_hours_scan",
+        max_instances=1,
+        coalesce=True,
     )
     scheduler.start()
-    logger.info("Scheduler başladı | NY 04:00-16:00 | pre-market + regular")
-    return scheduler
+    log.info("NASDAQ Trading Bot çalışıyor | NY session=%s | model=%s", TimezoneManager.market_session(), GEMINI_MODEL)
+    try:
+        while True:
+            time.sleep(60)
+    except (KeyboardInterrupt, SystemExit):
+        scheduler.shutdown(wait=False)
 
 # ============================================================
 # MAIN
 # ============================================================
 if __name__ == "__main__":
-    logger.info("==============================================")
-    logger.info("NASDAQ / NYSE SWING BOT BAŞLIYOR")
-    logger.info("NY: %s", TimezoneManager.now_ny().strftime("%Y-%m-%d %H:%M:%S"))
-    logger.info("TR: %s", TimezoneManager.now_tr().strftime("%Y-%m-%d %H:%M:%S"))
-    logger.info("Price range: $%.2f - $%.2f", MIN_PRICE, MAX_PRICE)
-    logger.info("Score minimum: %s | Penny score: %s", MIN_SCORE, PENNY_MIN_SCORE)
-    logger.info("Gemini keys: %s", len(GEMINI_API_KEYS))
-    logger.info("Telegram: %s", "OK" if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else "YOK")
-    logger.info("==============================================")
+    log.info("NASDAQ Swing Bot başlatılıyor...")
+    log.info("ENV: Gemini keys=%d | Telegram=%s | DB=%s", len(GEMINI_API_KEYS), bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID), DATABASE_PATH)
 
-    # SEC cache'i hazır tut. Asıl hızlı tarama Yahoo screener ile yapılır.
-    UniverseLoader.load_universe()
-    # GitHub Actions / tek seferlik cloud çalıştırma modu.
-    # `python main.py --once` yalnızca bir scan yapar ve çıkar.
-    # Böylece bilgisayarın açık kalmasına gerek kalmaz.
+    # Load/update SEC universe at startup.
+    UniverseLoader().load_sec()
+
     if "--once" in sys.argv:
-        logger.info("ONE-SHOT MODE: tek swing scan çalıştırılıyor.")
-        run_market_pipeline()
-        logger.info("ONE-SHOT MODE tamamlandı.")
-        raise SystemExit(0)
-
-    scheduler = start_scheduler()
-
-    # Normal sürekli çalışma modu.
-    run_market_pipeline()
-    logger.info("Bot çalışıyor. Scheduler bekleniyor...")
-
-    try:
-        while True:
-            time.sleep(60)
-    except KeyboardInterrupt:
-        logger.info("Bot durduruluyor...")
-        scheduler.shutdown(wait=False)
-        logger.info("Bot durdu.")
+        run_once()
+    else:
+        run_daemon()
