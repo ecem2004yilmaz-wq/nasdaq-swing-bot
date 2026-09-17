@@ -3,8 +3,7 @@ name: NASDAQ NYSE Swing Bot
 on:
   schedule:
     # New York time: 04:00-16:00, Monday-Friday, every 5 minutes.
-    # 04:00-09:25 = pre-market
-    # 09:30-16:00 = regular session
+    # 04:00-09:25 = pre-market, 09:30-16:00 = regular session.
     - cron: "*/5 4-15 * * 1-5"
       timezone: "America/New_York"
     - cron: "0 16 * * 1-5"
@@ -55,17 +54,18 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git pull --rebase origin main
-
+          # The scan changes alerts.db, so commit local changes BEFORE pulling.
+          # Pulling with unstaged SQLite changes caused the previous workflow failure.
           git add alerts.db
-
           if [ -f nasdaq_tickers.json ]; then
             git add nasdaq_tickers.json
           fi
 
           if git diff --cached --quiet; then
             echo "No bot state changes to commit."
-          else
-            git commit -m "Update bot state"
-            git push origin main
+            exit 0
           fi
+
+          git commit -m "Update bot state"
+          git pull --rebase origin main
+          git push origin main
