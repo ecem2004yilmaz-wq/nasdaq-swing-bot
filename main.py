@@ -42,21 +42,21 @@ MAX_SIGNAL_DAYS = 10
 NORMAL_SIGNAL_DAYS = 5
 
 # Sıkı kalite filtreleri.
-MIN_SCORE = 75
-PENNY_MIN_SCORE = 82
-MIN_RVOL = 1.50
-PENNY_MIN_RVOL = 2.50
-MIN_DAILY_CHANGE = 2.0
-MIN_DOLLAR_VOLUME = 500_000
-PENNY_MIN_DOLLAR_VOLUME = 1_000_000
-MIN_TP1_GAIN = 0.08       # %8
-MIN_TP2_GAIN = 0.15       # %15
-MIN_TP3_GAIN = 0.25       # %25
-MIN_RR = 2.00
+MIN_SCORE = 58
+PENNY_MIN_SCORE = 65
+MIN_RVOL = 1.00
+PENNY_MIN_RVOL = 0.50
+MIN_DAILY_CHANGE = 1.0
+MIN_DOLLAR_VOLUME = 200_000
+PENNY_MIN_DOLLAR_VOLUME = 350_000
+MIN_TP1_GAIN = 0.04       # %4
+MIN_TP2_GAIN = 0.08       # %8
+MIN_TP3_GAIN = 0.12       # %12
+MIN_RR = 1.30
 
 # Yahoo screener en fazla 250 sonuç döndürür. Ayrı ön filtreler birleştiriliyor.
 SCREENER_COUNT = 250
-DETAILED_CANDIDATES = 60
+DETAILED_CANDIDATES = 100
 MAX_WORKERS = 3
 YAHOO_TIMEOUT = 12
 YAHOO_RETRIES = 3
@@ -443,15 +443,14 @@ def get_active_universe():
 
         dollar_volume = price * volume
         min_dollar = PENNY_MIN_DOLLAR_VOLUME if price < 1 else MIN_DOLLAR_VOLUME
-        # Pre-market hacim regular seansa göre doğal olarak düşük olabilir;
-        # yine de gerçek para akışını filtrelemek için minimum tutar korunur.
+        # Pre-market hacmi regular seansa göre doğal olarak düşüktür.
         if dollar_volume < min_dollar:
             continue
 
         # Regular session'da momentum şartı daha güçlü; pre-market'te %1.5 gap bile
         # aday havuzuna girebilir, fakat detaylı teknik filtreler son kararı verir.
-        min_change = 1.5 if session == "PRE_MARKET" else MIN_DAILY_CHANGE
-        if change < min_change and (avg_volume <= 0 or volume < avg_volume * 1.25):
+        min_change = 0.5 if session == "PRE_MARKET" else MIN_DAILY_CHANGE
+        if change < min_change and (avg_volume <= 0 or volume < avg_volume * 0.50):
             continue
 
         rvol = volume / avg_volume if avg_volume > 0 else 0
@@ -464,6 +463,8 @@ def get_active_universe():
             score += 16
         elif change >= min_change:
             score += 10
+        elif session == "PRE_MARKET" and change >= 0.5:
+            score += 5
 
         if rvol >= 4:
             score += 30
@@ -655,18 +656,25 @@ def analyze_swing(symbol, quote):
     dollar_volume = day_volume * price
     if dollar_volume < (PENNY_MIN_DOLLAR_VOLUME if price < 1 else MIN_DOLLAR_VOLUME):
         return None
-    if rvol < (PENNY_MIN_RVOL if price < 1 else MIN_RVOL):
+    session_now = TimezoneManager.get_market_session()
+    rvol_floor = (PENNY_MIN_RVOL if price < 1 else MIN_RVOL)
+    if session_now == "PRE_MARKET":
+        rvol_floor = 0.50 if price < 1 else 0.30
+    if rvol < rvol_floor:
         return None
-    if rsi14 < 50 or rsi14 > 72:
+    if rsi14 < 42 or rsi14 > 78:
         return None
-    if price < ema20 or ema20 < ema50:
+    # Ana trend korunuyor: fiyat EMA50 üzerinde olmalı veya saatlik momentum
+    # yukarı dönmüş olmalı. EMA20/EMA50 kusursuz hizalanması şart değil.
+    trend_ok = price >= ema50 or (h_ema9 is not None and h_ema20 is not None and h_ema9 > h_ema20)
+    if not trend_ok:
         return None
-    min_session_change = 1.5 if TimezoneManager.get_market_session() == "PRE_MARKET" else MIN_DAILY_CHANGE
+    min_session_change = 0.5 if session_now == "PRE_MARKET" else MIN_DAILY_CHANGE
     if day_change < min_session_change and price < resistance1 * 0.98:
         return None
-    if spread_pct > 2.5 and price < 1:
+    if spread_pct > 4.0 and price < 1:
         return None
-    if spread_pct > 1.5 and price >= 1:
+    if spread_pct > 2.5 and price >= 1:
         return None
 
     # Hedefleri önce gerçek dirençlerden, yoksa ATR uzatmasından üret.
@@ -718,23 +726,31 @@ def analyze_swing(symbol, quote):
         score += 16
     elif rvol >= 1.5:
         score += 12
+    elif rvol >= 1.0:
+        score += 8
+    elif rvol >= 0.5:
+        score += 5
 
     if price > ema20 > ema50:
         score += 20
     elif price > ema20 and ema20 >= ema50:
-        score += 12
+        score += 15
+    elif price >= ema50:
+        score += 8
 
-    if 55 <= rsi14 <= 68:
+    if 52 <= rsi14 <= 68:
         score += 12
-    elif 50 <= rsi14 < 55 or 68 < rsi14 <= 72:
-        score += 7
+    elif 45 <= rsi14 < 52 or 68 < rsi14 <= 75:
+        score += 6
 
     if day_change >= 10:
         score += 15
     elif day_change >= 5:
         score += 12
-    elif day_change >= 2:
+    elif day_change >= 1.0:
         score += 8
+    elif day_change >= 0.5:
+        score += 5
 
     if price >= resistance1 * 0.995:
         score += 15
@@ -743,7 +759,7 @@ def analyze_swing(symbol, quote):
 
     if h_ema9 is not None and h_ema20 is not None and h_ema9 > h_ema20:
         score += 8
-    if h_rsi is not None and 50 <= h_rsi <= 72:
+    if h_rsi is not None and 48 <= h_rsi <= 75:
         score += 5
 
     if day_vwap and price >= day_vwap:
