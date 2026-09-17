@@ -29,7 +29,7 @@ GEMINI_API_KEYS = [
     os.getenv("GEMINI_API_KEY_2", "").strip(),
 ]
 GEMINI_API_KEYS = [k for k in GEMINI_API_KEYS if k]
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -620,7 +620,8 @@ def analyze_swing(symbol, quote):
         if None in (d_ema20, d_ema50, d_rsi, d_atr):
             return None
 
-        # Current day volume vs previous 20 completed daily bars.
+        # Daily RVOL is only a fallback. The primary RVOL is the latest
+        # completed 5-minute candle versus the 20 candles immediately before it.
         prev20 = d_vol[-21:-1] if len(d_vol) >= 21 else d_vol[:-1]
         avg_prev20 = sum(prev20) / len(prev20) if prev20 else 0
         day_rvol = (d_vol[-1] / avg_prev20) if avg_prev20 else 0
@@ -663,23 +664,21 @@ def analyze_swing(symbol, quote):
         vol_last = [x["volume"] or 0 for x in recent_intraday[-10:]]
         volume_increasing = len(vol_last) >= 6 and sum(vol_last[-3:]) / 3 > sum(vol_last[:3]) / 3
 
-        # Intraday RVOL: compare latest 5m bar with same-clock historical 5m bars.
+        # Primary RVOL: last COMPLETED 5m candle / average of the 20
+        # immediately preceding candles. The current in-progress candle is excluded.
         intraday_rvol = 0.0
-        if len(intraday) >= 100:
-            latest_dt, latest = today_rows[-1]
-            target_minute = latest_dt.hour * 60 + latest_dt.minute
-            same_slot = []
-            for dt, x in [(datetime.fromtimestamp(z["ts"], NY), z) for z in intraday]:
-                if dt.date() == ny_today:
-                    continue
-                minute = dt.hour * 60 + dt.minute
-                if abs(minute - target_minute) <= 5 and x["volume"]:
-                    same_slot.append(x["volume"])
-            if same_slot:
-                base = sum(same_slot[-20:]) / min(20, len(same_slot))
+        usable = recent_intraday if len(recent_intraday) >= 22 else intraday[-22:]
+        if len(usable) >= 22:
+            current_bar = usable[-2]
+            baseline = [x["volume"] or 0 for x in usable[-22:-2]]
+            baseline = [v for v in baseline if v > 0]
+            if len(baseline) >= 10:
+                base = sum(baseline) / len(baseline)
                 if base > 0:
-                    intraday_rvol = (latest["volume"] or 0) / base
-        rvol = max(day_rvol, intraday_rvol, safe_float(quote.get("rvol"), 0) or 0)
+                    intraday_rvol = (current_bar["volume"] or 0) / base
+        # Do not mix Yahoo screener's cumulative intraday volume ratio into the
+        # candle RVOL; that was the source of misleading values such as 0.25.
+        rvol = intraday_rvol if intraday_rvol > 0 else day_rvol
 
         # Resistance / breakout levels from completed daily bars.
         prev_daily = daily[:-1]
@@ -711,7 +710,8 @@ def analyze_swing(symbol, quote):
             return None
         if price < d_ema20 * 0.94 and (h_ema9 is None or h_ema9 <= h_ema20):
             return None
-        if rvol < MIN_RVOL and dollar_volume < MIN_PRICE_DOLLAR_VOLUME:
+        # No volume confirmation = no bullish swing signal.
+        if rvol < MIN_RVOL:
             return None
 
         # ---------------- SCORE ----------------
@@ -762,26 +762,35 @@ def analyze_swing(symbol, quote):
         if risk <= 0 or risk / price > 0.25:
             return None
 
-        # Targets prioritize nearby resistance, then ATR-based extensions.
-        levels = [r for r in (resistance5, resistance20, high52) if r and r > price]
-        if levels:
-            first = min(levels)
+        # Targets are deliberately bounded by risk/ATR so a distant 52-week
+        # high cannot create absurd RR values such as 17x.
+        min_tp1 = max(price * 1.04, price + 1.5 * risk)
+        max_tp1 = price + 2.5 * risk
+        resistance_levels = sorted({
+            round(r, 6) for r in (resistance5, resistance20, high52)
+            if r and r >= min_tp1 and r <= max_tp1
+        })
+        if resistance_levels:
+            tp1 = resistance_levels[0]
         else:
-            first = price + d_atr * 1.5
-        tp1 = max(price * 1.04, first)
-        tp2 = max(price * 1.08, price + d_atr * 2.2)
-        tp3 = max(price * 1.12, price + d_atr * 3.2)
+            tp1 = min(max_tp1, max(min_tp1, price + 1.5 * d_atr))
 
-        # If resistance is too close, don't use it as a tiny TP1.
-        if tp1 <= price * 1.025:
-            tp1 = price + d_atr * 1.2
-        if tp2 <= tp1:
-            tp2 = tp1 + d_atr * 0.8
-        if tp3 <= tp2:
-            tp3 = tp2 + d_atr * 0.8
+        # Keep the targets ordered and progressively farther away, while
+        # capping the total target distance at 4R.
+        tp2 = min(price + 3.25 * risk, max(tp1 + 0.75 * risk, price + 2.0 * d_atr))
+        tp3 = min(price + 4.0 * risk, max(tp2 + 0.75 * risk, price + 3.0 * d_atr))
+        if tp2 <= tp1 or tp3 <= tp2:
+            return None
 
-        rr = (tp2 - price) / risk if risk else 0
-        if rr < MIN_RR:
+        tp1_gain = tp1 / price - 1
+        tp2_gain = tp2 / price - 1
+        tp3_gain = tp3 / price - 1
+        if tp1_gain < 0.04 or tp2_gain < 0.08 or tp3_gain < 0.12:
+            return None
+
+        # RR shown in Telegram is explicitly TP1 RR.
+        rr = (tp1 - price) / risk if risk else 0
+        if rr < MIN_RR or rr > 2.5:
             return None
         if rr >= IDEAL_RR:
             score += 5
@@ -889,12 +898,27 @@ Candidates:
                 client = self._client(key)
                 if client is None:
                     break
-                response = client.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=prompt,
-                )
+                # Gemini 3.6 Flash is supported through the current Interactions API.
+                # Keep generate_content as a compatibility fallback for older SDKs.
+                text = ""
+                try:
+                    interaction = client.interactions.create(
+                        model=GEMINI_MODEL,
+                        input=prompt,
+                        generation_config={"thinking_level": "low"},
+                    )
+                    text = (getattr(interaction, "output_text", "") or "").strip()
+                except Exception as interaction_error:
+                    log.warning("Gemini Interactions API failed; trying legacy generateContent: %s", interaction_error)
+                    response = client.models.generate_content(
+                        model=GEMINI_MODEL,
+                        contents=prompt,
+                    )
+                    text = (getattr(response, "text", "") or "").strip()
+
+                if not text:
+                    raise RuntimeError("Gemini boş yanıt döndürdü")
                 DB.increment_gemini()
-                text = (getattr(response, "text", "") or "").strip()
                 if text.startswith("```"):
                     text = text.replace("```json", "").replace("```", "").strip()
                 parsed = json.loads(text)
