@@ -36,12 +36,12 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 DATABASE_PATH = os.getenv("DATABASE_PATH", "alerts.db")
 TICKER_CACHE_FILE = os.getenv("TICKER_CACHE_FILE", "nasdaq_tickers.json")
 
-MIN_PRICE = 0.01
+MIN_PRICE = 0.50
 MAX_PRICE = 15.00
 
 # Candidate discovery. These are deliberately broad; the score decides quality.
-MIN_DOLLAR_VOLUME = 150_000
-MIN_PRICE_DOLLAR_VOLUME = 250_000
+MIN_DOLLAR_VOLUME = 200_000
+MIN_PRICE_DOLLAR_VOLUME = 350_000
 MIN_AVG_DAILY_VOLUME = 50_000
 
 # Signal thresholds
@@ -56,6 +56,9 @@ IDEAL_RR = 2.00
 
 # Signal management
 SIGNAL_COOLDOWN_MINUTES = 30
+MAX_DAILY_GAIN_LONG = 25.0
+MIN_RSI_LONG = 45.0
+MAX_RSI_LONG = 78.0
 COOLDOWN_SCORE_OVERRIDE = 10
 COOLDOWN_RVOL_OVERRIDE = 1.5
 COOLDOWN_MOVE_OVERRIDE = 0.03
@@ -65,7 +68,7 @@ NORMAL_EXPECTED_DAYS = "1–5 gün"
 # API / scan controls
 SCREENER_COUNT = 250
 DETAILED_CANDIDATES = 120
-MAX_WORKERS = 8
+MAX_WORKERS = 10
 YAHOO_TIMEOUT = 10
 YAHOO_RETRIES = 2
 YAHOO_BASE_BACKOFF = 1.2
@@ -706,12 +709,24 @@ def analyze_swing(symbol, quote):
         # Hard rejects: not a clean bullish setup.
         if d_rsi > 82:
             return None
+        # Avoid chasing extremely extended daily moves.
+        if daily_change := safe_float(quote.get("change"), 0):
+            if daily_change > MAX_DAILY_GAIN_LONG:
+                return None
         if h_rsi is not None and h_rsi > 82 and h_momentum < 0:
             return None
         if price < d_ema20 * 0.94 and (h_ema9 is None or h_ema9 <= h_ema20):
             return None
         # No volume confirmation = no bullish swing signal.
         if rvol < MIN_RVOL:
+            return None
+        # RSI below 45 is treated as early/mixed momentum, not a LONG setup.
+        if d_rsi < MIN_RSI_LONG:
+            return None
+        # Do not send weak non-breakout setups merely because several soft
+        # indicators happen to score points.
+        if (not breakout and not near_resistance and rvol < 1.20
+                and daily_change < 1.0):
             return None
 
         # ---------------- SCORE ----------------
@@ -1134,9 +1149,19 @@ def run_market_pipeline():
         for c in top:
             g = gemini.get(c["symbol"], {"decision": "WATCH", "reason": ""})
             decision = g.get("decision", "WATCH")
-            # Gemini PASS rejects; WATCH does not erase a strong technical setup.
+            # PASS always rejects. WATCH is allowed only for exceptionally
+            # strong technical setups; otherwise avoid noisy Telegram alerts.
             if decision == "PASS":
                 continue
+            if decision == "WATCH":
+                weak_setup = (
+                    c["score"] < STRONG_SCORE
+                    or c["rsi"] < MIN_RSI_LONG
+                    or c["daily_change"] > MAX_DAILY_GAIN_LONG
+                    or (not c["breakout"] and c["rvol"] < 1.20 and c["daily_change"] < 1.0)
+                )
+                if weak_setup:
+                    continue
             c["gemini_status"] = decision
             c["gemini_reason"] = g.get("reason", "")[:300]
             msg = build_open_message(c)
