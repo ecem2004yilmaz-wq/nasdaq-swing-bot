@@ -199,14 +199,43 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_swing_symbol ON swing_signals(symbol);
             """)
 
-            # Backward-compatible migration: older versions used a different
-            # counter column in gemini_usage.  SQLite CREATE TABLE IF NOT EXISTS
-            # does not modify an existing table, so add the current column when
-            # necessary and copy any known legacy counter into it.
-            cols = {row[1] for row in c.execute("PRAGMA table_info(gemini_usage)").fetchall()}
-            if "requests" not in cols:
+            # Backward-compatible migration for older gemini_usage schemas.
+            # Older versions used names such as date/count. Normalize the tiny
+            # daily-counter table before any Gemini query is executed.
+            info = c.execute("PRAGMA table_info(gemini_usage)").fetchall()
+            cols = {row[1] for row in info}
+
+            if "day" not in cols:
+                legacy_date = next((name for name in (
+                    "date", "usage_date", "request_date", "day_date"
+                ) if name in cols), None)
+                legacy_count = next((name for name in (
+                    "count", "request_count", "total_requests", "usage", "requests_count"
+                ) if name in cols), None)
+
+                c.execute("ALTER TABLE gemini_usage RENAME TO gemini_usage_legacy")
+                c.execute("""
+                    CREATE TABLE gemini_usage (
+                        day TEXT PRIMARY KEY,
+                        requests INTEGER DEFAULT 0
+                    )
+                """)
+
+                if legacy_date and legacy_count:
+                    c.execute(
+                        f"""INSERT OR REPLACE INTO gemini_usage(day, requests)
+                            SELECT CAST("{legacy_date}" AS TEXT),
+                                   COALESCE(CAST("{legacy_count}" AS INTEGER), 0)
+                            FROM gemini_usage_legacy
+                            WHERE "{legacy_date}" IS NOT NULL"""
+                    )
+                c.execute("DROP TABLE gemini_usage_legacy")
+
+            elif "requests" not in cols:
                 c.execute("ALTER TABLE gemini_usage ADD COLUMN requests INTEGER DEFAULT 0")
-                legacy = next((name for name in ("count", "request_count", "total_requests", "usage") if name in cols), None)
+                legacy = next((name for name in (
+                    "count", "request_count", "total_requests", "usage", "requests_count"
+                ) if name in cols), None)
                 if legacy:
                     c.execute(f'UPDATE gemini_usage SET requests = COALESCE("{legacy}", 0)')
 
