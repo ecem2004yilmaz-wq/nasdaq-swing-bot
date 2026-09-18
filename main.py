@@ -63,12 +63,13 @@ COOLDOWN_SCORE_OVERRIDE = 10
 COOLDOWN_RVOL_OVERRIDE = 1.5
 COOLDOWN_MOVE_OVERRIDE = 0.03
 MAX_SIGNAL_DAYS = 10
-NORMAL_EXPECTED_DAYS = "1–5 gün"
+NORMAL_EXPECTED_DAYS = "1–3 gün"
 
 # API / scan controls
 SCREENER_COUNT = 500
-DETAILED_CANDIDATES = 200
-MAX_WORKERS = 12
+QUOTE_BATCH_SIZE = 100
+DETAILED_CANDIDATES = 350
+MAX_WORKERS = 16
 YAHOO_TIMEOUT = 10
 YAHOO_RETRIES = 2
 YAHOO_BASE_BACKOFF = 1.2
@@ -80,6 +81,7 @@ TR = ZoneInfo("Europe/Istanbul")
 
 SEC_TICKER_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
 YAHOO_SCREENER_URL = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
+YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 
 # ============================================================
@@ -540,55 +542,87 @@ class CandidateScanner:
         quotes = result[0].get("quotes") or []
         return quotes
 
+    def _merge_quote(self, q, session, merged):
+        sym = str(q.get("symbol", "")).upper()
+        if sym not in self.allowed:
+            return
+        price = safe_float(q.get("regularMarketPrice"))
+        pre = safe_float(q.get("preMarketPrice"))
+        post = safe_float(q.get("postMarketPrice"))
+        if session == "PRE_MARKET" and pre:
+            price = pre
+        elif session == "AFTER_HOURS" and post:
+            price = post
+        if price is None or not (MIN_PRICE <= price <= MAX_PRICE):
+            return
+        volume = safe_float(q.get("regularMarketVolume"), 0) or 0
+        avg_volume = safe_float(q.get("averageDailyVolume3Month"), 0) or 0
+        regular_change = safe_float(q.get("regularMarketChangePercent"), 0) or 0
+        prev_close = safe_float(q.get("regularMarketPreviousClose"), 0) or 0
+        pre_volume = safe_float(q.get("preMarketVolume"), 0) or 0
+        pre_change = safe_float(q.get("preMarketChangePercent"), 0) or 0
+        if not pre_change and pre and prev_close:
+            pre_change = (pre / prev_close - 1.0) * 100.0
+        if session == "PRE_MARKET":
+            change = pre_change
+            if pre_volume > 0:
+                volume = pre_volume
+        elif session == "AFTER_HOURS":
+            change = safe_float(q.get("postMarketChangePercent"), 0) or regular_change
+        else:
+            change = regular_change
+        dollar = price * max(volume, avg_volume * 0.15)
+        if avg_volume < MIN_AVG_DAILY_VOLUME and dollar < MIN_DOLLAR_VOLUME:
+            return
+        old = merged.get(sym)
+        item = {
+            "symbol": sym,
+            "price": price,
+            "volume": volume,
+            "avg_volume": avg_volume,
+            "change": change,
+            "regular_change": regular_change,
+            "premarket_change": pre_change,
+            "premarket_volume": pre_volume,
+            "dollar_volume": dollar,
+        }
+        if old is None or item["change"] > old["change"] or item["volume"] > old["volume"]:
+            merged[sym] = item
+
+    def _direct_quote_scan(self, session, merged):
+        symbols = sorted(self.allowed)
+        for i in range(0, len(symbols), QUOTE_BATCH_SIZE):
+            batch = symbols[i:i + QUOTE_BATCH_SIZE]
+            try:
+                r = http_get(
+                    YAHOO_QUOTE_URL,
+                    params={"symbols": ",".join(batch)},
+                    timeout=12,
+                    retries=1,
+                )
+                data = r.json()
+                quotes = ((data.get("quoteResponse") or {}).get("result") or [])
+                for q in quotes:
+                    self._merge_quote(q, session, merged)
+            except Exception as e:
+                log.warning("Yahoo direct quote batch %d-%d failed: %s", i, i + len(batch), e)
+
     def get_active_universe(self):
         merged = {}
+        session = TimezoneManager.market_session()
+
+        # PRIMARY DISCOVERY: scan the SEC universe in quote batches. This is
+        # the important change: a fast mover no longer has to appear in a
+        # Yahoo predefined screener before it can reach technical analysis.
+        self._direct_quote_scan(session, merged)
+
+        # SECONDARY DISCOVERY: predefined screeners add names/fields that a
+        # quote batch can occasionally miss and strengthen premarket ranking.
         for sid in self.PREDEFINED:
             try:
                 quotes = self._screener(sid)
                 for q in quotes:
-                    sym = str(q.get("symbol", "")).upper()
-                    if sym not in self.allowed:
-                        continue
-                    price = safe_float(q.get("regularMarketPrice"))
-                    pre = safe_float(q.get("preMarketPrice"))
-                    post = safe_float(q.get("postMarketPrice"))
-                    session = TimezoneManager.market_session()
-                    if session == "PRE_MARKET" and pre:
-                        price = pre
-                    elif session == "AFTER_HOURS" and post:
-                        price = post
-                    if price is None or not (MIN_PRICE <= price <= MAX_PRICE):
-                        continue
-                    volume = safe_float(q.get("regularMarketVolume"), 0) or 0
-                    avg_volume = safe_float(q.get("averageDailyVolume3Month"), 0) or 0
-                    regular_change = safe_float(q.get("regularMarketChangePercent"), 0) or 0
-                    prev_close = safe_float(q.get("regularMarketPreviousClose"), 0) or 0
-                    pre_volume = safe_float(q.get("preMarketVolume"), 0) or 0
-                    pre_change = ((pre - prev_close) / prev_close * 100) if pre and prev_close else 0.0
-                    # During pre-market, use the live pre-market move and volume
-                    # for discovery. Yahoo's regularMarketChangePercent is stale
-                    # until the regular session, which can hide a stock that is
-                    # already moving sharply before 09:30 ET.
-                    if session == "PRE_MARKET":
-                        change = pre_change
-                        if pre_volume > 0:
-                            volume = pre_volume
-                    else:
-                        change = regular_change
-                    dollar = price * max(volume, avg_volume * 0.15)
-                    if avg_volume < MIN_AVG_DAILY_VOLUME and dollar < MIN_DOLLAR_VOLUME:
-                        continue
-                    merged[sym] = {
-                        "symbol": sym,
-                        "price": price,
-                        "volume": volume,
-                        "avg_volume": avg_volume,
-                        "change": change,
-                        "regular_change": regular_change,
-                        "premarket_change": pre_change,
-                        "premarket_volume": pre_volume,
-                        "dollar_volume": dollar,
-                    }
+                    self._merge_quote(q, session, merged)
             except Exception as e:
                 log.warning("Yahoo screener %s failed: %s", sid, e)
 
@@ -615,6 +649,33 @@ class CandidateScanner:
             return s
         candidates.sort(key=quick_score, reverse=True)
         return candidates
+
+# ============================================================
+# SHORT-TERM MOMENTUM HORIZON
+# ============================================================
+def pct_change_from_bars(rows, bars):
+    if len(rows) <= bars:
+        return 0.0
+    old = rows[-(bars + 1)]["close"]
+    new = rows[-1]["close"]
+    if not old:
+        return 0.0
+    return (new / old - 1.0) * 100.0
+
+
+def classify_momentum_horizon(m5, m15, m30, h1, rvol, near_high, breakout):
+    # This is a time-horizon label, not a price prediction or guarantee.
+    explosive = (rvol >= 2.0 and near_high and (breakout or m15 >= 8.0))
+    if m5 >= 8.0 and m15 >= 12.0 and explosive:
+        return "5–15 dk | ÇOK KISA VADE MOMENTUM", "VERY_SHORT"
+    if m15 >= 10.0 and m30 >= 15.0 and explosive:
+        return "15–60 dk | INTRADAY MOMENTUM", "SHORT"
+    if m30 >= 8.0 and h1 >= 10.0 and rvol >= 1.5 and (breakout or near_high):
+        return "1–4 saat | GÜN İÇİ MOMENTUM", "INTRADAY"
+    if h1 >= 5.0 and rvol >= 1.3:
+        return "Bugün | GÜN İÇİ / KISA VADE", "DAY"
+    return "1–3 gün | SWING", "SWING"
+
 
 # ============================================================
 # TECHNICAL ANALYSIS / BULLISH SCORE
@@ -686,6 +747,16 @@ def analyze_swing(symbol, quote):
         vwap = pv / vv if vv else None
 
         recent_intraday = [x for _, x in tp]
+
+        # Multi-horizon momentum. Five-minute bars let us distinguish a stock
+        # that may move in the next few minutes from a slower 1-3 day setup.
+        m5_change = pct_change_from_bars(recent_intraday, 1)
+        m15_change = pct_change_from_bars(recent_intraday, 3)
+        m30_change = pct_change_from_bars(recent_intraday, 6)
+        h1_change = pct_change_from_bars(recent_intraday, 12)
+        recent_30_high = max((x["high"] for x in recent_intraday[-30:] if x.get("high") is not None), default=price)
+        near_intraday_high = price >= recent_30_high * 0.985 if recent_30_high else False
+
         last5 = recent_intraday[-5:] if len(recent_intraday) >= 5 else recent_intraday
         rising_count = sum(1 for i in range(1, len(last5)) if last5[i]["close"] > last5[i-1]["close"])
         last3 = recent_intraday[-3:] if len(recent_intraday) >= 3 else recent_intraday
@@ -708,6 +779,10 @@ def analyze_swing(symbol, quote):
         # Do not mix Yahoo screener's cumulative intraday volume ratio into the
         # candle RVOL; that was the source of misleading values such as 0.25.
         rvol = intraday_rvol if intraday_rvol > 0 else day_rvol
+        momentum_horizon, momentum_horizon_code = classify_momentum_horizon(
+            m5_change, m15_change, m30_change, h1_change, rvol,
+            near_intraday_high, False,
+        )
 
         # Resistance / breakout levels from completed daily bars.
         prev_daily = daily[:-1]
@@ -717,6 +792,10 @@ def analyze_swing(symbol, quote):
         near_resistance = resistance20 > 0 and price >= resistance20 * 0.97
         breakout = price > resistance20
         distance_to_res = ((resistance20 - price) / price) if price else 999
+        momentum_horizon, momentum_horizon_code = classify_momentum_horizon(
+            m5_change, m15_change, m30_change, h1_change, rvol,
+            near_intraday_high, breakout,
+        )
 
         # Spread proxy if quote provides bid/ask; otherwise don't reject.
         bid = safe_float(quote.get("bid"))
@@ -750,6 +829,10 @@ def analyze_swing(symbol, quote):
             return None
         # RSI below 45 is treated as early/mixed momentum, not a LONG setup.
         if d_rsi < MIN_RSI_LONG:
+            return None
+        # Explosive setups must still have positive short-term momentum. This
+        # prevents the scanner from chasing a stock that already reversed.
+        if extended_move and m15_change < 3.0 and not breakout:
             return None
         if extended_move and not (rvol >= 2.0 and volume_increasing and (breakout or near_resistance)):
             return None
@@ -791,6 +874,24 @@ def analyze_swing(symbol, quote):
             score += 3
         if volume_increasing:
             score += 8; reasons.append("Hacim artıyor")
+
+        # Short-term momentum bonuses. These deliberately have a large weight
+        # so a fresh runner can reach detailed analysis even when its daily
+        # swing indicators have not caught up yet.
+        if m5_change >= 3:
+            score += 8; reasons.append("5dk momentum +3%")
+        if m5_change >= 8:
+            score += 7; reasons.append("5dk momentum +8%")
+        if m15_change >= 5:
+            score += 8; reasons.append("15dk momentum +5%")
+        if m15_change >= 12:
+            score += 7; reasons.append("15dk momentum +12%")
+        if m30_change >= 8:
+            score += 6; reasons.append("30dk momentum +8%")
+        if h1_change >= 10:
+            score += 5; reasons.append("1s momentum +10%")
+        if near_intraday_high:
+            score += 6; reasons.append("Gün içi zirveye yakın")
 
         # Small bonus for meaningful liquidity, but do not let liquidity dominate.
         if dollar_volume >= 1_000_000:
@@ -871,8 +972,15 @@ def analyze_swing(symbol, quote):
             "daily_change": round(daily_change, 2),
             "extended_move": extended_move,
             "premarket_change": round(safe_float(quote.get("premarket_change"), 0) or 0, 2),
+            "m5_change": round(m5_change, 2),
+            "m15_change": round(m15_change, 2),
+            "m30_change": round(m30_change, 2),
+            "h1_change": round(h1_change, 2),
+            "near_intraday_high": near_intraday_high,
+            "momentum_horizon": momentum_horizon,
+            "momentum_horizon_code": momentum_horizon_code,
             "rr": round(rr, 2),
-            "expected_days": NORMAL_EXPECTED_DAYS,
+            "expected_days": momentum_horizon,
             "strength": strength,
             "vwap": vwap,
             "vwap_status": "ABOVE" if vwap is not None and price >= vwap else "BELOW",
@@ -920,6 +1028,11 @@ class GeminiEvaluator:
                 "rsi": c["rsi"],
                 "rr": c["rr"],
                 "daily_change": c["daily_change"],
+                "m5_change": c.get("m5_change", 0),
+                "m15_change": c.get("m15_change", 0),
+                "m30_change": c.get("m30_change", 0),
+                "h1_change": c.get("h1_change", 0),
+                "momentum_horizon": c.get("momentum_horizon", NORMAL_EXPECTED_DAYS),
                 "vwap": c["vwap_status"],
                 "breakout": c["breakout"],
                 "volume_increasing": c["volume_increasing"],
@@ -928,7 +1041,7 @@ class GeminiEvaluator:
         prompt = """
 You are a neutral technical screener assisting a short-term US stock alert bot.
 Evaluate only the supplied candidates. Do not invent news or fundamentals.
-Focus on whether the technical setup has short-term bullish momentum for roughly 1-5 trading days.
+Focus on whether the supplied setup has actionable bullish momentum and which time horizon best matches the CURRENT momentum: 5-15 minutes, 15-60 minutes, 1-4 hours, today, or 1-3 days. Do not assume a stock will rise; classify the evidence only.
 Return ONLY valid JSON as an array. Each item must be:
 {"symbol":"XYZ","decision":"BUY|WATCH|PASS","reason":"short Turkish reason"}
 BUY = technically coherent bullish setup.
@@ -1028,13 +1141,16 @@ def build_open_message(c):
         f"🎯 TP3: ${c['tp3']:.4f}\n\n"
         f"🛑 Stop: ${c['stop']:.4f}\n"
         f"⚖️ RR: {c['rr']:.2f}\n\n"
-        f"⏱ Beklenen süre: {c['expected_days']}\n"
-        f"📈 Günlük: {c['daily_change']:+.2f}%\n"
+        f"⏱ Momentum ufku: {c.get('momentum_horizon', c['expected_days'])}\n"
+        f"⚡ 5dk: {c.get('m5_change', 0):+.2f}% | 15dk: {c.get('m15_change', 0):+.2f}% | 30dk: {c.get('m30_change', 0):+.2f}%\n"
+        f"🕐 1s: {c.get('h1_change', 0):+.2f}% | Günlük: {c['daily_change']:+.2f}%\n"
         + (f"🔥 Pre-market: {c.get('premarket_change', 0):+.2f}%\n" if c.get('premarket_change', 0) else "")
         + ("⚠️ Yüksek volatilite / momentum\n" if c.get('extended_move') else "")
         + "\n"
         + f"🤖 Gemini: {gem or 'Teknik skor baz alındı.'}\n\n"
-        "🟢 Durum: AKTİF"
+        "🟢 Durum: AKTİF\n\n"
+        "⚠️ Not: Bu bir momentum sinyalidir; yükseliş garantisi yoktur.\n"
+        "Kısa vadeli hareketlerde volatilite ve işlem durdurmaları görülebilir."
     )
 
 
@@ -1171,13 +1287,25 @@ def run_market_pipeline():
             log.info("Detaylı teknik taramada uygun aday çıkmadı.")
             return
 
-        results.sort(key=lambda x: (x["score"], x["rr"], x["rvol"]), reverse=True)
+        # Prioritize fresh, short-horizon momentum instead of letting a slower
+        # 1-5 day setup bury a stock that is accelerating RIGHT NOW.
+        horizon_priority = {"VERY_SHORT": 5, "SHORT": 4, "INTRADAY": 3, "DAY": 2, "SWING": 1}
+        results.sort(
+            key=lambda x: (
+                horizon_priority.get(x.get("momentum_horizon_code"), 0),
+                x.get("m15_change", 0),
+                x.get("m5_change", 0),
+                x["score"],
+                x["rvol"],
+            ),
+            reverse=True,
+        )
         eligible = [r for r in results if cooldown_allows(r["symbol"], r)]
         if not eligible:
             log.info("Adaylar bulundu ancak açık/soğuma filtresinden geçmedi.")
             return
 
-        top = eligible[:8]
+        top = eligible[:12]
         gemini = GEMINI.evaluate(top)
 
         sent = 0
@@ -1191,16 +1319,17 @@ def run_market_pipeline():
                 continue
             if decision == "WATCH":
                 strong_explosive = (
-                    c.get("extended_move", False)
-                    and c["score"] >= STRONG_SCORE
+                    c.get("momentum_horizon_code") in {"VERY_SHORT", "SHORT"}
+                    and c["score"] >= 75
                     and c["rvol"] >= 2.0
                     and c["volume_increasing"]
-                    and (c["breakout"] or c["near_resistance"])
+                    and (c["breakout"] or c["near_resistance"] or c.get("near_intraday_high"))
+                    and c.get("m15_change", 0) >= 8.0
                 )
                 weak_setup = (
-                    (c["score"] < STRONG_SCORE and not strong_explosive)
+                    (c["score"] < MOMENTUM_SCORE and not strong_explosive)
                     or c["rsi"] < MIN_RSI_LONG
-                    or (not c["breakout"] and c["rvol"] < 1.20 and c["daily_change"] < 1.0)
+                    or (not strong_explosive and not c["breakout"] and c["rvol"] < 1.20 and c["daily_change"] < 1.0)
                 )
                 if weak_setup:
                     continue
