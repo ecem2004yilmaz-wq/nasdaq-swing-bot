@@ -84,8 +84,10 @@ YAHOO_SCREENER_URL = "https://query1.finance.yahoo.com/v1/finance/screener/prede
 YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 NASDAQ_MOVERS_URL = "https://api.nasdaq.com/api/marketmovers"
-ENABLE_YAHOO_DIRECT_QUOTES = False
-ENABLE_YAHOO_SCREENERS = False
+ENABLE_YAHOO_DIRECT_QUOTES = True
+ENABLE_YAHOO_SCREENERS = True
+YAHOO_CRUMB = None
+YAHOO_CRUMB_LOCK = threading.Lock()
 
 # ============================================================
 # LOGGING
@@ -109,6 +111,56 @@ SESSION.headers.update({
 })
 
 SCAN_LOCK = threading.Lock()
+
+
+def _ensure_yahoo_crumb(force=False):
+    global YAHOO_CRUMB
+    with YAHOO_CRUMB_LOCK:
+        if YAHOO_CRUMB and not force:
+            return YAHOO_CRUMB
+        try:
+            # Yahoo's v7 quote/screener endpoints currently require a cookie
+            # + crumb pair. The older unauthenticated calls return HTTP 401.
+            SESSION.get("https://fc.yahoo.com", timeout=8, allow_redirects=True)
+        except Exception:
+            pass
+        try:
+            r = SESSION.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=8, allow_redirects=True)
+            r.raise_for_status()
+            crumb = r.text.strip()
+            if crumb and "html" not in crumb.lower():
+                YAHOO_CRUMB = crumb
+                return crumb
+        except Exception as e:
+            log.warning("Yahoo crumb alınamadı: %s", e)
+        return None
+
+
+def yahoo_request(url, params=None, timeout=YAHOO_TIMEOUT, retries=YAHOO_RETRIES):
+    params = dict(params or {})
+    crumb = _ensure_yahoo_crumb()
+    if crumb:
+        params["crumb"] = crumb
+    for attempt in range(retries + 1):
+        try:
+            r = SESSION.get(url, params=params, timeout=timeout)
+            if r.status_code == 401:
+                crumb = _ensure_yahoo_crumb(force=True)
+                if crumb:
+                    params["crumb"] = crumb
+                    r = SESSION.get(url, params=params, timeout=timeout)
+            if r.status_code == 200:
+                return r
+            if r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(YAHOO_BASE_BACKOFF * (attempt + 1))
+                continue
+            r.raise_for_status()
+        except Exception as exc:
+            if attempt < retries:
+                time.sleep(YAHOO_BASE_BACKOFF * (attempt + 1))
+                continue
+            raise
+    raise RuntimeError("Yahoo request failed")
 
 
 def http_get(url, params=None, timeout=YAHOO_TIMEOUT, retries=YAHOO_RETRIES):
@@ -537,7 +589,7 @@ class CandidateScanner:
 
     def _screener(self, scr_id):
         params = {"scrIds": scr_id, "count": SCREENER_COUNT, "start": 0}
-        r = http_get(YAHOO_SCREENER_URL, params=params, timeout=12, retries=2)
+        r = yahoo_request(YAHOO_SCREENER_URL, params=params, timeout=12, retries=2)
         data = r.json()
         result = data.get("finance", {}).get("result") or []
         if not result:
@@ -698,7 +750,7 @@ class CandidateScanner:
         for i in range(0, len(symbols), QUOTE_BATCH_SIZE):
             batch = symbols[i:i + QUOTE_BATCH_SIZE]
             try:
-                r = http_get(
+                r = yahoo_request(
                     YAHOO_QUOTE_URL,
                     params={"symbols": ",".join(batch)},
                     timeout=12,
@@ -719,8 +771,8 @@ class CandidateScanner:
         # already accelerating without relying on Yahoo's private quote API.
         self._nasdaq_market_movers(session, merged)
 
-        # Optional Yahoo fallbacks. Disabled by default because Yahoo's
-        # undocumented endpoints are currently returning 401/400 in CI.
+        # Yahoo is a secondary broad discovery source. We use a live cookie+crumb
+        # session so the current v7 endpoint is not called anonymously.
         self._direct_quote_scan(session, merged)
         if ENABLE_YAHOO_SCREENERS:
             for sid in self.PREDEFINED:
