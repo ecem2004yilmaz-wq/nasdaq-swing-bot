@@ -83,6 +83,9 @@ SEC_TICKER_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
 YAHOO_SCREENER_URL = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
 YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+NASDAQ_MOVERS_URL = "https://api.nasdaq.com/api/marketmovers"
+ENABLE_YAHOO_DIRECT_QUOTES = False
+ENABLE_YAHOO_SCREENERS = False
 
 # ============================================================
 # LOGGING
@@ -589,7 +592,108 @@ class CandidateScanner:
         if old is None or item["change"] > old["change"] or item["volume"] > old["volume"]:
             merged[sym] = item
 
+    def _nasdaq_market_movers(self, session, merged):
+        # Yahoo's undocumented quote/screener endpoints can return 401/400
+        # without the required session/crumb state. Do not make the whole
+        # discovery layer depend on those endpoints. Nasdaq's public market-
+        # movers feed is designed for current US market movers and exposes
+        # gainers and most-active names.
+        if session not in {"PRE_MARKET", "REGULAR", "AFTER_HOURS"}:
+            return
+        try:
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/140.0 Safari/537.36"
+                ),
+                "Accept": "application/json, text/plain, */*",
+                "Referer": "https://www.nasdaq.com/",
+                "Origin": "https://www.nasdaq.com",
+            }
+            r = SESSION.get(
+                NASDAQ_MOVERS_URL,
+                params={"assetclass": "stocks", "exchangeStatus": "currentMarket"},
+                headers=headers,
+                timeout=12,
+            )
+            r.raise_for_status()
+            payload = r.json()
+
+            # The public endpoint has changed nesting names over time. Walk
+            # all nested lists and accept rows that look like stock-mover
+            # records instead of depending on one brittle response shape.
+            rows = []
+            def walk(obj):
+                if isinstance(obj, dict):
+                    if str(obj.get("symbol", "")).upper():
+                        rows.append(obj)
+                    for v in obj.values():
+                        walk(v)
+                elif isinstance(obj, list):
+                    for v in obj:
+                        walk(v)
+            walk(payload)
+
+            added = 0
+            seen = set()
+            for q in rows:
+                sym = str(q.get("symbol", "")).upper().strip()
+                if not sym or sym in seen or sym not in self.allowed:
+                    continue
+                seen.add(sym)
+                price = (
+                    safe_float(q.get("lastSale"))
+                    or safe_float(q.get("lastTrade"))
+                    or safe_float(q.get("lastPrice"))
+                    or safe_float(q.get("price"))
+                )
+                change = (
+                    safe_float(q.get("percentChange"))
+                    if q.get("percentChange") is not None
+                    else safe_float(q.get("percent_change"), 0)
+                ) or 0.0
+                volume = (
+                    safe_float(q.get("cummulativeVolume"))
+                    or safe_float(q.get("cumulativeVolume"))
+                    or safe_float(q.get("volume"))
+                    or 0.0
+                )
+                dollar = (
+                    safe_float(q.get("dollarAmountTraded"))
+                    or safe_float(q.get("dollarVolume"))
+                    or (price * volume if price and volume else 0.0)
+                )
+                if price is None or not (MIN_PRICE <= price <= MAX_PRICE):
+                    continue
+                if dollar < MIN_DOLLAR_VOLUME and volume <= 0:
+                    continue
+                avg_volume = 0.0
+                prev_close = price / (1.0 + change / 100.0) if change > -99.9 else 0.0
+                item = {
+                    "symbol": sym,
+                    "price": price,
+                    "volume": volume,
+                    "avg_volume": avg_volume,
+                    "change": change,
+                    "regular_change": change,
+                    "premarket_change": 0.0,
+                    "premarket_volume": 0.0,
+                    "dollar_volume": dollar,
+                    "prev_close": prev_close,
+                    "source": "NASDAQ_MARKET_MOVERS",
+                }
+                old = merged.get(sym)
+                if old is None or change > old.get("change", -999) or volume > old.get("volume", 0):
+                    merged[sym] = item
+                    added += 1
+            log.info("Nasdaq market movers: %d aday bulundu", added)
+        except Exception as e:
+            log.warning("Nasdaq market movers failed: %s", e)
+
     def _direct_quote_scan(self, session, merged):
+        if not ENABLE_YAHOO_DIRECT_QUOTES:
+            return
         symbols = sorted(self.allowed)
         for i in range(0, len(symbols), QUOTE_BATCH_SIZE):
             batch = symbols[i:i + QUOTE_BATCH_SIZE]
@@ -611,20 +715,21 @@ class CandidateScanner:
         merged = {}
         session = TimezoneManager.market_session()
 
-        # PRIMARY DISCOVERY: scan the SEC universe in quote batches. This is
-        # the important change: a fast mover no longer has to appear in a
-        # Yahoo predefined screener before it can reach technical analysis.
-        self._direct_quote_scan(session, merged)
+        # PRIMARY DISCOVERY: Nasdaq market movers. This catches the names
+        # already accelerating without relying on Yahoo's private quote API.
+        self._nasdaq_market_movers(session, merged)
 
-        # SECONDARY DISCOVERY: predefined screeners add names/fields that a
-        # quote batch can occasionally miss and strengthen premarket ranking.
-        for sid in self.PREDEFINED:
-            try:
-                quotes = self._screener(sid)
-                for q in quotes:
-                    self._merge_quote(q, session, merged)
-            except Exception as e:
-                log.warning("Yahoo screener %s failed: %s", sid, e)
+        # Optional Yahoo fallbacks. Disabled by default because Yahoo's
+        # undocumented endpoints are currently returning 401/400 in CI.
+        self._direct_quote_scan(session, merged)
+        if ENABLE_YAHOO_SCREENERS:
+            for sid in self.PREDEFINED:
+                try:
+                    quotes = self._screener(sid)
+                    for q in quotes:
+                        self._merge_quote(q, session, merged)
+                except Exception as e:
+                    log.warning("Yahoo screener %s failed: %s", sid, e)
 
         candidates = list(merged.values())
         # Discovery score deliberately gives pre-market movers a direct path
@@ -1362,16 +1467,8 @@ def run_daemon():
     # Premarket + regular market: every 5 minutes.
     scheduler.add_job(
         run_market_pipeline,
-        CronTrigger(day_of_week="mon-fri", hour="4-15", minute="*/5", timezone=NY),
+        CronTrigger(day_of_week="mon-fri", hour="4-20", minute="*/5", timezone=NY),
         id="market_scan",
-        max_instances=1,
-        coalesce=True,
-    )
-    # One after-hours scan at 16:00 NY.
-    scheduler.add_job(
-        run_market_pipeline,
-        CronTrigger(day_of_week="mon-fri", hour="16", minute="0", timezone=NY),
-        id="after_hours_scan",
         max_instances=1,
         coalesce=True,
     )
