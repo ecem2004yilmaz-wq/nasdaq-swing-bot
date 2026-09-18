@@ -66,9 +66,9 @@ MAX_SIGNAL_DAYS = 10
 NORMAL_EXPECTED_DAYS = "1–5 gün"
 
 # API / scan controls
-SCREENER_COUNT = 250
-DETAILED_CANDIDATES = 120
-MAX_WORKERS = 10
+SCREENER_COUNT = 500
+DETAILED_CANDIDATES = 200
+MAX_WORKERS = 12
 YAHOO_TIMEOUT = 10
 YAHOO_RETRIES = 2
 YAHOO_BASE_BACKOFF = 1.2
@@ -561,7 +561,20 @@ class CandidateScanner:
                         continue
                     volume = safe_float(q.get("regularMarketVolume"), 0) or 0
                     avg_volume = safe_float(q.get("averageDailyVolume3Month"), 0) or 0
-                    change = safe_float(q.get("regularMarketChangePercent"), 0) or 0
+                    regular_change = safe_float(q.get("regularMarketChangePercent"), 0) or 0
+                    prev_close = safe_float(q.get("regularMarketPreviousClose"), 0) or 0
+                    pre_volume = safe_float(q.get("preMarketVolume"), 0) or 0
+                    pre_change = ((pre - prev_close) / prev_close * 100) if pre and prev_close else 0.0
+                    # During pre-market, use the live pre-market move and volume
+                    # for discovery. Yahoo's regularMarketChangePercent is stale
+                    # until the regular session, which can hide a stock that is
+                    # already moving sharply before 09:30 ET.
+                    if session == "PRE_MARKET":
+                        change = pre_change
+                        if pre_volume > 0:
+                            volume = pre_volume
+                    else:
+                        change = regular_change
                     dollar = price * max(volume, avg_volume * 0.15)
                     if avg_volume < MIN_AVG_DAILY_VOLUME and dollar < MIN_DOLLAR_VOLUME:
                         continue
@@ -571,21 +584,34 @@ class CandidateScanner:
                         "volume": volume,
                         "avg_volume": avg_volume,
                         "change": change,
+                        "regular_change": regular_change,
+                        "premarket_change": pre_change,
+                        "premarket_volume": pre_volume,
                         "dollar_volume": dollar,
                     }
             except Exception as e:
                 log.warning("Yahoo screener %s failed: %s", sid, e)
 
         candidates = list(merged.values())
-        # Prefer active names but do not demand a large green daily candle.
+        # Discovery score deliberately gives pre-market movers a direct path
+        # into technical analysis. This is important for explosive names that
+        # can move 50%+ before the regular session and otherwise be invisible
+        # to a regular-session day-gainer screener.
+        premarket = TimezoneManager.market_session() == "PRE_MARKET"
         def quick_score(x):
             s = 0
-            if x["change"] > 0: s += 10
-            if x["change"] >= 3: s += 5
+            change = x["change"]
+            if change > 0: s += 10
+            if change >= 3: s += 5
+            if change >= 10: s += 10
+            if change >= 25: s += 15
+            if change >= 50: s += 15
             if x["volume"] >= x["avg_volume"] * 1.5 > 0: s += 10
             if x["volume"] >= x["avg_volume"] * 2.5 > 0: s += 10
             if x["dollar_volume"] >= 1_000_000: s += 10
             elif x["dollar_volume"] >= 500_000: s += 5
+            if premarket and x["premarket_volume"] > 0:
+                s += 8
             return s
         candidates.sort(key=quick_score, reverse=True)
         return candidates
@@ -709,10 +735,12 @@ def analyze_swing(symbol, quote):
         # Hard rejects: not a clean bullish setup.
         if d_rsi > 82:
             return None
-        # Avoid chasing extremely extended daily moves.
-        if daily_change := safe_float(quote.get("change"), 0):
-            if daily_change > MAX_DAILY_GAIN_LONG:
-                return None
+        # Very large moves are not automatically rejected anymore. We want to
+        # catch genuine momentum runners early. Instead, an extended move must
+        # have stronger confirmation (high RVOL + rising volume + breakout/near
+        # resistance) before it can become a LONG candidate.
+        daily_change = safe_float(quote.get("change"), 0) or 0
+        extended_move = daily_change > MAX_DAILY_GAIN_LONG
         if h_rsi is not None and h_rsi > 82 and h_momentum < 0:
             return None
         if price < d_ema20 * 0.94 and (h_ema9 is None or h_ema9 <= h_ema20):
@@ -722,6 +750,8 @@ def analyze_swing(symbol, quote):
             return None
         # RSI below 45 is treated as early/mixed momentum, not a LONG setup.
         if d_rsi < MIN_RSI_LONG:
+            return None
+        if extended_move and not (rvol >= 2.0 and volume_increasing and (breakout or near_resistance)):
             return None
         # Do not send weak non-breakout setups merely because several soft
         # indicators happen to score points.
@@ -839,6 +869,8 @@ def analyze_swing(symbol, quote):
             "rvol": round(rvol, 2),
             "rsi": round(d_rsi, 1),
             "daily_change": round(daily_change, 2),
+            "extended_move": extended_move,
+            "premarket_change": round(safe_float(quote.get("premarket_change"), 0) or 0, 2),
             "rr": round(rr, 2),
             "expected_days": NORMAL_EXPECTED_DAYS,
             "strength": strength,
@@ -997,8 +1029,11 @@ def build_open_message(c):
         f"🛑 Stop: ${c['stop']:.4f}\n"
         f"⚖️ RR: {c['rr']:.2f}\n\n"
         f"⏱ Beklenen süre: {c['expected_days']}\n"
-        f"📈 Günlük: {c['daily_change']:+.2f}%\n\n"
-        f"🤖 Gemini: {gem or 'Teknik skor baz alındı.'}\n\n"
+        f"📈 Günlük: {c['daily_change']:+.2f}%\n"
+        + (f"🔥 Pre-market: {c.get('premarket_change', 0):+.2f}%\n" if c.get('premarket_change', 0) else "")
+        + ("⚠️ Yüksek volatilite / momentum\n" if c.get('extended_move') else "")
+        + "\n"
+        + f"🤖 Gemini: {gem or 'Teknik skor baz alındı.'}\n\n"
         "🟢 Durum: AKTİF"
     )
 
@@ -1149,15 +1184,22 @@ def run_market_pipeline():
         for c in top:
             g = gemini.get(c["symbol"], {"decision": "WATCH", "reason": ""})
             decision = g.get("decision", "WATCH")
-            # PASS always rejects. WATCH is allowed only for exceptionally
-            # strong technical setups; otherwise avoid noisy Telegram alerts.
+            # PASS always rejects. WATCH can pass only when the technical setup
+            # is exceptionally strong OR it is an explosive, strongly confirmed
+            # momentum move that we explicitly want to catch early.
             if decision == "PASS":
                 continue
             if decision == "WATCH":
+                strong_explosive = (
+                    c.get("extended_move", False)
+                    and c["score"] >= STRONG_SCORE
+                    and c["rvol"] >= 2.0
+                    and c["volume_increasing"]
+                    and (c["breakout"] or c["near_resistance"])
+                )
                 weak_setup = (
-                    c["score"] < STRONG_SCORE
+                    (c["score"] < STRONG_SCORE and not strong_explosive)
                     or c["rsi"] < MIN_RSI_LONG
-                    or c["daily_change"] > MAX_DAILY_GAIN_LONG
                     or (not c["breakout"] and c["rvol"] < 1.20 and c["daily_change"] < 1.0)
                 )
                 if weak_setup:
