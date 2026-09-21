@@ -70,7 +70,7 @@ NORMAL_EXPECTED_DAYS = "1–3 gün"
 
 # API / scan controls
 SCREENER_COUNT = 500
-SPARK_BATCH_SIZE = 50
+SPARK_BATCH_SIZE = 20
 SPARK_SYMBOLS_PER_SCAN = 500
 SPARK_MIN_PAUSE = 0.35
 DETAILED_CANDIDATES = 100
@@ -526,6 +526,13 @@ def atr(highs, lows, closes, period=14):
 
 def safe_float(v, default=None):
     try:
+        if v is None:
+            return default
+        if isinstance(v, str):
+            text = v.strip().replace(",", "").replace("$", "").replace("%", "")
+            if text in {"", "-", "--", "N/A", "n/a"}:
+                return default
+            v = text
         x = float(v)
         if x != x or x in (float("inf"), float("-inf")):
             return default
@@ -763,12 +770,13 @@ class CandidateScanner:
                     for v in obj:
                         walk(v)
             walk(payload)
+            log.info("Nasdaq market movers response: %d symbol-like rows", len(rows))
 
             added = 0
             seen = set()
             for q in rows:
                 sym = str(q.get("symbol", "")).upper().strip()
-                if not sym or sym in seen or sym not in self.allowed:
+                if not sym or sym in seen:
                     continue
                 seen.add(sym)
                 price = (
@@ -844,74 +852,81 @@ class CandidateScanner:
         selected = symbols[start:start + SPARK_SYMBOLS_PER_SCAN]
 
         added = 0
-        for i in range(0, len(selected), SPARK_BATCH_SIZE):
-            batch = selected[i:i + SPARK_BATCH_SIZE]
+
+        def process_response(data):
+            nonlocal added
+            results = ((data.get("spark") or {}).get("result") or [])
+            for item in results:
+                sym = str(item.get("symbol", "")).upper()
+                if sym not in self.allowed:
+                    continue
+                resp = item.get("response") or {}
+                meta = resp.get("meta") or {}
+                closes = ((resp.get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
+                closes = [safe_float(x) for x in closes if safe_float(x) is not None]
+                if not closes:
+                    continue
+                price = closes[-1]
+                if not (MIN_PRICE <= price <= MAX_PRICE):
+                    continue
+                prev = safe_float(meta.get("chartPreviousClose")) or safe_float(meta.get("previousClose"))
+                if not prev or prev <= 0:
+                    continue
+                change = (price / prev - 1.0) * 100.0
+                m5 = (price / closes[-2] - 1.0) * 100.0 if len(closes) >= 2 and closes[-2] else 0.0
+                m15 = (price / closes[-4] - 1.0) * 100.0 if len(closes) >= 4 and closes[-4] else 0.0
+                m30 = (price / closes[-7] - 1.0) * 100.0 if len(closes) >= 7 and closes[-7] else 0.0
+                item_q = {
+                    "symbol": sym, "regularMarketPrice": price,
+                    "regularMarketPreviousClose": prev,
+                    "regularMarketChangePercent": change,
+                    "regularMarketVolume": 0, "averageDailyVolume3Month": 0,
+                    "preMarketPrice": 0, "postMarketPrice": 0,
+                    "preMarketVolume": 0, "preMarketChangePercent": 0,
+                    "_spark_m5": m5, "_spark_m15": m15, "_spark_m30": m30,
+                    "_spark_change": change, "_source": "SPARK",
+                }
+                before = sym in merged
+                self._merge_quote(item_q, session, merged)
+                if sym in merged:
+                    merged[sym]["spark_m5"] = m5
+                    merged[sym]["spark_m15"] = m15
+                    merged[sym]["spark_m30"] = m30
+                    merged[sym]["_source"] = merged[sym].get("_source") or "SPARK"
+                    if not before:
+                        added += 1
+
+        def fetch_batch(batch, label):
+            if not batch:
+                return False
             try:
                 r = http_get(
                     YAHOO_SPARK_URL,
-                    params={
-                        "symbols": ",".join(batch),
-                        "range": "1d",
-                        "interval": "5m",
-                        "includePrePost": "true",
-                    },
-                    timeout=15,
-                    retries=1,
+                    params={"symbols": ",".join(batch), "range": "1d", "interval": "5m", "includePrePost": "true"},
+                    timeout=15, retries=1,
                 )
-                data = r.json()
-                results = ((data.get("spark") or {}).get("result") or [])
-                for item in results:
-                    sym = str(item.get("symbol", "")).upper()
-                    if sym not in self.allowed:
-                        continue
-                    resp = item.get("response") or {}
-                    meta = resp.get("meta") or {}
-                    closes = ((resp.get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
-                    closes = [safe_float(x) for x in closes if safe_float(x) is not None]
-                    if not closes:
-                        continue
-                    price = closes[-1]
-                    if not (MIN_PRICE <= price <= MAX_PRICE):
-                        continue
-                    prev = safe_float(meta.get("chartPreviousClose")) or safe_float(meta.get("previousClose"))
-                    if not prev or prev <= 0:
-                        continue
-
-                    change = (price / prev - 1.0) * 100.0
-                    m5 = (price / closes[-2] - 1.0) * 100.0 if len(closes) >= 2 and closes[-2] else 0.0
-                    m15 = (price / closes[-4] - 1.0) * 100.0 if len(closes) >= 4 and closes[-4] else 0.0
-                    m30 = (price / closes[-7] - 1.0) * 100.0 if len(closes) >= 7 and closes[-7] else 0.0
-
-                    item_q = {
-                        "symbol": sym,
-                        "regularMarketPrice": price,
-                        "regularMarketPreviousClose": prev,
-                        "regularMarketChangePercent": change,
-                        "regularMarketVolume": 0,
-                        "averageDailyVolume3Month": 0,
-                        "preMarketPrice": 0,
-                        "postMarketPrice": 0,
-                        "preMarketVolume": 0,
-                        "preMarketChangePercent": 0,
-                        "_spark_m5": m5,
-                        "_spark_m15": m15,
-                        "_spark_m30": m30,
-                        "_spark_change": change,
-                        "_source": "SPARK",
-                    }
-                    before = sym in merged
-                    self._merge_quote(item_q, session, merged)
-                    if sym in merged:
-                        merged[sym]["spark_m5"] = m5
-                        merged[sym]["spark_m15"] = m15
-                        merged[sym]["spark_m30"] = m30
-                        merged[sym]["_source"] = merged[sym].get("_source") or "SPARK"
-                        added += 0 if before else 1
+                process_response(r.json())
+                return False
             except Exception as e:
-                log.warning("Yahoo Spark batch %d-%d failed: %s", start + i, start + i + len(batch), e)
-                if "429" in str(e):
+                msg = str(e)
+                if "400" in msg and len(batch) > 1:
+                    mid = len(batch) // 2
+                    log.warning("Yahoo Spark 400: batch %s (%d) bölünüyor", label, len(batch))
+                    stop_left = fetch_batch(batch[:mid], f"{label}a")
+                    if stop_left:
+                        return True
+                    return fetch_batch(batch[mid:], f"{label}b")
+                if "429" in msg:
                     log.warning("Yahoo 429: Spark taraması bu tur için durduruldu.")
-                    break
+                    _yahoo_mark_rate_limited()
+                    return True
+                log.warning("Yahoo Spark batch %s failed: %s", label, e)
+                return False
+
+        for i in range(0, len(selected), SPARK_BATCH_SIZE):
+            batch = selected[i:i + SPARK_BATCH_SIZE]
+            if fetch_batch(batch, f"{start + i}-{start + i + len(batch)}"):
+                break
             time.sleep(SPARK_MIN_PAUSE)
 
         log.info(
@@ -1626,6 +1641,7 @@ def run_market_pipeline():
 
         scanner = CandidateScanner(allowed)
         quick = scanner.get_active_universe()
+        log.info("Discovery funnel: %d quick candidates before technical analysis", len(quick))
         if not quick:
             log.warning("Broad discovery bu turda aday döndürmedi; yeni aday taraması yok.")
             return
