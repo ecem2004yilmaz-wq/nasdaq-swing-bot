@@ -70,7 +70,7 @@ NORMAL_EXPECTED_DAYS = "1–3 gün"
 
 # API / scan controls
 SCREENER_COUNT = 500
-SPARK_BATCH_SIZE = 20
+SPARK_BATCH_SIZE = 10
 SPARK_SYMBOLS_PER_SCAN = 500
 SPARK_MIN_PAUSE = 0.35
 DETAILED_CANDIDATES = 100
@@ -770,6 +770,29 @@ class CandidateScanner:
                     for v in obj:
                         walk(v)
             walk(payload)
+            # The endpoint normally returns data.gainers.rows / data.mostActive.rows.
+            # Keep the generic walker as a fallback, but explicitly inspect these
+            # containers because Nasdaq has changed the response wrapper several times.
+            data_obj = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(data_obj, dict):
+                for key in ("gainers", "mostActive", "mostactive", "decliners", "losers"):
+                    section = data_obj.get(key)
+                    if isinstance(section, dict):
+                        section_rows = section.get("rows")
+                        if isinstance(section_rows, list):
+                            rows.extend(x for x in section_rows if isinstance(x, dict))
+                    elif isinstance(section, list):
+                        rows.extend(x for x in section if isinstance(x, dict))
+
+            # De-duplicate the generic + explicit extraction.
+            unique_rows = []
+            row_keys = set()
+            for row in rows:
+                key = (str(row.get("symbol", "")).upper(), str(row.get("lastSale", "")), str(row.get("lastTrade", "")))
+                if key[0] and key not in row_keys:
+                    row_keys.add(key)
+                    unique_rows.append(row)
+            rows = unique_rows
             log.info("Nasdaq market movers response: %d symbol-like rows", len(rows))
 
             added = 0
@@ -855,13 +878,31 @@ class CandidateScanner:
 
         def process_response(data):
             nonlocal added
-            results = ((data.get("spark") or {}).get("result") or [])
+            spark = data.get("spark") if isinstance(data, dict) else None
+            if isinstance(spark, dict):
+                results = spark.get("result") or []
+            elif isinstance(spark, list):
+                # Yahoo has returned both {spark:{result:[...]}} and
+                # {spark:[...]} shapes depending on the edge/API version.
+                results = spark
+            else:
+                results = []
+            if not isinstance(results, list):
+                results = []
             for item in results:
+                if not isinstance(item, dict):
+                    continue
                 sym = str(item.get("symbol", "")).upper()
                 if sym not in self.allowed:
                     continue
                 resp = item.get("response") or {}
+                if isinstance(resp, list):
+                    resp = resp[0] if resp and isinstance(resp[0], dict) else {}
+                if not isinstance(resp, dict):
+                    resp = {}
                 meta = resp.get("meta") or {}
+                if not isinstance(meta, dict):
+                    meta = {}
                 closes = ((resp.get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
                 closes = [safe_float(x) for x in closes if safe_float(x) is not None]
                 if not closes:
