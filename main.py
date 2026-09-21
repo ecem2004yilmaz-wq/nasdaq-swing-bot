@@ -82,16 +82,7 @@ TR = ZoneInfo("Europe/Istanbul")
 SEC_TICKER_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
 YAHOO_SCREENER_URL = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
 YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
-YAHOO_SPARK_URL = "https://query1.finance.yahoo.com/v7/finance/spark"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-NASDAQ_MOVERS_URL = "https://api.nasdaq.com/api/marketmovers"
-ENABLE_YAHOO_DIRECT_QUOTES = False
-# v7/finance/quote is frequently rate-limited/401 behind GitHub Actions.
-# Use the unauthenticated Spark endpoint for broad discovery instead.
-ENABLE_YAHOO_SPARK_SCAN = True
-ENABLE_YAHOO_SCREENERS = True
-YAHOO_CRUMB = None
-YAHOO_CRUMB_LOCK = threading.Lock()
 
 # ============================================================
 # LOGGING
@@ -115,56 +106,6 @@ SESSION.headers.update({
 })
 
 SCAN_LOCK = threading.Lock()
-
-
-def _ensure_yahoo_crumb(force=False):
-    global YAHOO_CRUMB
-    with YAHOO_CRUMB_LOCK:
-        if YAHOO_CRUMB and not force:
-            return YAHOO_CRUMB
-        try:
-            # Yahoo's v7 quote/screener endpoints currently require a cookie
-            # + crumb pair. The older unauthenticated calls return HTTP 401.
-            SESSION.get("https://fc.yahoo.com", timeout=8, allow_redirects=True)
-        except Exception:
-            pass
-        try:
-            r = SESSION.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=8, allow_redirects=True)
-            r.raise_for_status()
-            crumb = r.text.strip()
-            if crumb and "html" not in crumb.lower():
-                YAHOO_CRUMB = crumb
-                return crumb
-        except Exception as e:
-            log.warning("Yahoo crumb alınamadı: %s", e)
-        return None
-
-
-def yahoo_request(url, params=None, timeout=YAHOO_TIMEOUT, retries=YAHOO_RETRIES):
-    params = dict(params or {})
-    crumb = _ensure_yahoo_crumb()
-    if crumb:
-        params["crumb"] = crumb
-    for attempt in range(retries + 1):
-        try:
-            r = SESSION.get(url, params=params, timeout=timeout)
-            if r.status_code == 401:
-                crumb = _ensure_yahoo_crumb(force=True)
-                if crumb:
-                    params["crumb"] = crumb
-                    r = SESSION.get(url, params=params, timeout=timeout)
-            if r.status_code == 200:
-                return r
-            if r.status_code in (429, 500, 502, 503, 504):
-                time.sleep(YAHOO_BASE_BACKOFF * (attempt + 1))
-                continue
-            r.raise_for_status()
-        except Exception as exc:
-            if attempt < retries:
-                time.sleep(YAHOO_BASE_BACKOFF * (attempt + 1))
-                continue
-            raise
-    raise RuntimeError("Yahoo request failed")
 
 
 def http_get(url, params=None, timeout=YAHOO_TIMEOUT, retries=YAHOO_RETRIES):
@@ -592,34 +533,14 @@ class CandidateScanner:
         self.allowed = set(allowed_symbols)
 
     def _screener(self, scr_id):
-        params = {
-            "scrIds": scr_id,
-            "count": SCREENER_COUNT,
-            "start": 0,
-            "formatted": "false",
-            "lang": "en-US",
-            "region": "US",
-            "corsDomain": "finance.yahoo.com",
-        }
-        # Predefined screeners are also available without the crumb-protected
-        # v7 quote endpoint. Try query2 first, then query1 as fallback.
-        urls = [
-            "https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved",
-            YAHOO_SCREENER_URL,
-        ]
-        last = None
-        for url in urls:
-            try:
-                r = http_get(url, params=params, timeout=12, retries=1)
-                data = r.json()
-                result = data.get("finance", {}).get("result") or []
-                if result:
-                    return result[0].get("quotes") or []
-            except Exception as e:
-                last = e
-        if last:
-            raise last
-        return []
+        params = {"scrIds": scr_id, "count": SCREENER_COUNT, "start": 0}
+        r = http_get(YAHOO_SCREENER_URL, params=params, timeout=12, retries=2)
+        data = r.json()
+        result = data.get("finance", {}).get("result") or []
+        if not result:
+            return []
+        quotes = result[0].get("quotes") or []
+        return quotes
 
     def _merge_quote(self, q, session, merged):
         sym = str(q.get("symbol", "")).upper()
@@ -651,7 +572,7 @@ class CandidateScanner:
         else:
             change = regular_change
         dollar = price * max(volume, avg_volume * 0.15)
-        if avg_volume < MIN_AVG_DAILY_VOLUME and dollar < MIN_DOLLAR_VOLUME and q.get("_spark_m15") is None:
+        if avg_volume < MIN_AVG_DAILY_VOLUME and dollar < MIN_DOLLAR_VOLUME:
             return
         old = merged.get(sym)
         item = {
@@ -664,216 +585,46 @@ class CandidateScanner:
             "premarket_change": pre_change,
             "premarket_volume": pre_volume,
             "dollar_volume": dollar,
-            "spark_m5": safe_float(q.get("_spark_m5"), 0) or 0.0,
-            "spark_m15": safe_float(q.get("_spark_m15"), 0) or 0.0,
-            "spark_m30": safe_float(q.get("_spark_m30"), 0) or 0.0,
         }
         if old is None or item["change"] > old["change"] or item["volume"] > old["volume"]:
             merged[sym] = item
 
-    def _nasdaq_market_movers(self, session, merged):
-        # Yahoo's undocumented quote/screener endpoints can return 401/400
-        # without the required session/crumb state. Do not make the whole
-        # discovery layer depend on those endpoints. Nasdaq's public market-
-        # movers feed is designed for current US market movers and exposes
-        # gainers and most-active names.
-        if session not in {"PRE_MARKET", "REGULAR", "AFTER_HOURS"}:
-            return
-        try:
-            headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/140.0 Safari/537.36"
-                ),
-                "Accept": "application/json, text/plain, */*",
-                "Referer": "https://www.nasdaq.com/",
-                "Origin": "https://www.nasdaq.com",
-            }
-            r = SESSION.get(
-                NASDAQ_MOVERS_URL,
-                params={"assetclass": "stocks", "exchangeStatus": "currentMarket"},
-                headers=headers,
-                timeout=12,
-            )
-            r.raise_for_status()
-            payload = r.json()
-
-            # The public endpoint has changed nesting names over time. Walk
-            # all nested lists and accept rows that look like stock-mover
-            # records instead of depending on one brittle response shape.
-            rows = []
-            def walk(obj):
-                if isinstance(obj, dict):
-                    if str(obj.get("symbol", "")).upper():
-                        rows.append(obj)
-                    for v in obj.values():
-                        walk(v)
-                elif isinstance(obj, list):
-                    for v in obj:
-                        walk(v)
-            walk(payload)
-
-            added = 0
-            seen = set()
-            for q in rows:
-                sym = str(q.get("symbol", "")).upper().strip()
-                if not sym or sym in seen or sym not in self.allowed:
-                    continue
-                seen.add(sym)
-                price = (
-                    safe_float(q.get("lastSale"))
-                    or safe_float(q.get("lastTrade"))
-                    or safe_float(q.get("lastPrice"))
-                    or safe_float(q.get("price"))
-                )
-                change = (
-                    safe_float(q.get("percentChange"))
-                    if q.get("percentChange") is not None
-                    else safe_float(q.get("percent_change"), 0)
-                ) or 0.0
-                volume = (
-                    safe_float(q.get("cummulativeVolume"))
-                    or safe_float(q.get("cumulativeVolume"))
-                    or safe_float(q.get("volume"))
-                    or 0.0
-                )
-                dollar = (
-                    safe_float(q.get("dollarAmountTraded"))
-                    or safe_float(q.get("dollarVolume"))
-                    or (price * volume if price and volume else 0.0)
-                )
-                if price is None or not (MIN_PRICE <= price <= MAX_PRICE):
-                    continue
-                if dollar < MIN_DOLLAR_VOLUME and volume <= 0:
-                    continue
-                avg_volume = 0.0
-                prev_close = price / (1.0 + change / 100.0) if change > -99.9 else 0.0
-                item = {
-                    "symbol": sym,
-                    "price": price,
-                    "volume": volume,
-                    "avg_volume": avg_volume,
-                    "change": change,
-                    "regular_change": change,
-                    "premarket_change": 0.0,
-                    "premarket_volume": 0.0,
-                    "dollar_volume": dollar,
-                    "prev_close": prev_close,
-                    "source": "NASDAQ_MARKET_MOVERS",
-                }
-                old = merged.get(sym)
-                if old is None or change > old.get("change", -999) or volume > old.get("volume", 0):
-                    merged[sym] = item
-                    added += 1
-            log.info("Nasdaq market movers: %d aday bulundu", added)
-        except Exception as e:
-            log.warning("Nasdaq market movers failed: %s", e)
-
-    def _spark_scan(self, session, merged):
-        """Broad discovery without Yahoo's crumb-protected v7 quote API.
-
-        Yahoo's Spark endpoint can return intraday closes for many symbols at
-        once and does not require the cookie/crumb pair that was causing 401/429
-        errors in GitHub Actions.  We only use it to find movers; full technical
-        analysis still happens later through the chart endpoint.
-        """
-        if not ENABLE_YAHOO_SPARK_SCAN:
-            return
+    def _direct_quote_scan(self, session, merged):
         symbols = sorted(self.allowed)
-        added = 0
         for i in range(0, len(symbols), QUOTE_BATCH_SIZE):
             batch = symbols[i:i + QUOTE_BATCH_SIZE]
             try:
                 r = http_get(
-                    YAHOO_SPARK_URL,
-                    params={
-                        "symbols": ",".join(batch),
-                        "range": "1d",
-                        "interval": "5m",
-                        "includePrePost": "true",
-                    },
-                    timeout=15,
-                    retries=2,
+                    YAHOO_QUOTE_URL,
+                    params={"symbols": ",".join(batch)},
+                    timeout=12,
+                    retries=1,
                 )
                 data = r.json()
-                results = ((data.get("spark") or {}).get("result") or [])
-                for item in results:
-                    sym = str(item.get("symbol", "")).upper()
-                    if sym not in self.allowed:
-                        continue
-                    resp = item.get("response") or {}
-                    meta = resp.get("meta") or {}
-                    closes = ((resp.get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
-                    closes = [safe_float(x) for x in closes if safe_float(x) is not None]
-                    if not closes:
-                        continue
-                    price = closes[-1]
-                    if not (MIN_PRICE <= price <= MAX_PRICE):
-                        continue
-                    prev = safe_float(meta.get("chartPreviousClose")) or safe_float(meta.get("previousClose"))
-                    if not prev or prev <= 0:
-                        continue
-                    change = (price / prev - 1.0) * 100.0
-                    # Estimate recent intraday acceleration from Spark closes.
-                    m5 = (price / closes[-2] - 1.0) * 100.0 if len(closes) >= 2 and closes[-2] else 0.0
-                    m15 = (price / closes[-4] - 1.0) * 100.0 if len(closes) >= 4 and closes[-4] else 0.0
-                    m30 = (price / closes[-7] - 1.0) * 100.0 if len(closes) >= 7 and closes[-7] else 0.0
-                    dollar = 0.0
-                    item_q = {
-                        "symbol": sym,
-                        "regularMarketPrice": price,
-                        "regularMarketPreviousClose": prev,
-                        "regularMarketChangePercent": change,
-                        "regularMarketVolume": 0,
-                        "averageDailyVolume3Month": 0,
-                        "preMarketPrice": 0,
-                        "postMarketPrice": 0,
-                        "preMarketVolume": 0,
-                        "preMarketChangePercent": 0,
-                        "_spark_m5": m5,
-                        "_spark_m15": m15,
-                        "_spark_m30": m30,
-                        "_spark_change": change,
-                    }
-                    self._merge_quote(item_q, session, merged)
-                    if sym in merged:
-                        merged[sym]["spark_m5"] = m5
-                        merged[sym]["spark_m15"] = m15
-                        merged[sym]["spark_m30"] = m30
-                        merged[sym]["dollar_volume"] = dollar
-                        added += 1
+                quotes = ((data.get("quoteResponse") or {}).get("result") or [])
+                for q in quotes:
+                    self._merge_quote(q, session, merged)
             except Exception as e:
-                log.warning("Yahoo Spark batch %d-%d failed: %s", i, i + len(batch), e)
-            # Small pause prevents GitHub's shared egress from hammering Yahoo.
-            time.sleep(0.08)
-        log.info("Yahoo Spark broad scan: %d aday bulundu", len(merged))
-
-    def _direct_quote_scan(self, session, merged):
-        # Kept as a compatibility wrapper; the old v7 quote endpoint is
-        # deliberately disabled because it is the source of the 401/429 loop.
-        if ENABLE_YAHOO_DIRECT_QUOTES:
-            self._spark_scan(session, merged)
+                log.warning("Yahoo direct quote batch %d-%d failed: %s", i, i + len(batch), e)
 
     def get_active_universe(self):
         merged = {}
         session = TimezoneManager.market_session()
 
-        # PRIMARY DISCOVERY: Nasdaq market movers. This catches the names
-        # already accelerating without relying on Yahoo's private quote API.
-        self._nasdaq_market_movers(session, merged)
+        # PRIMARY DISCOVERY: scan the SEC universe in quote batches. This is
+        # the important change: a fast mover no longer has to appear in a
+        # Yahoo predefined screener before it can reach technical analysis.
+        self._direct_quote_scan(session, merged)
 
-        # Yahoo is a secondary broad discovery source. We use a live cookie+crumb
-        # session so the current v7 endpoint is not called anonymously.
-        self._spark_scan(session, merged)
-        if ENABLE_YAHOO_SCREENERS:
-            for sid in self.PREDEFINED:
-                try:
-                    quotes = self._screener(sid)
-                    for q in quotes:
-                        self._merge_quote(q, session, merged)
-                except Exception as e:
-                    log.warning("Yahoo screener %s failed: %s", sid, e)
+        # SECONDARY DISCOVERY: predefined screeners add names/fields that a
+        # quote batch can occasionally miss and strengthen premarket ranking.
+        for sid in self.PREDEFINED:
+            try:
+                quotes = self._screener(sid)
+                for q in quotes:
+                    self._merge_quote(q, session, merged)
+            except Exception as e:
+                log.warning("Yahoo screener %s failed: %s", sid, e)
 
         candidates = list(merged.values())
         # Discovery score deliberately gives pre-market movers a direct path
@@ -1611,8 +1362,16 @@ def run_daemon():
     # Premarket + regular market: every 5 minutes.
     scheduler.add_job(
         run_market_pipeline,
-        CronTrigger(day_of_week="mon-fri", hour="4-20", minute="*/5", timezone=NY),
+        CronTrigger(day_of_week="mon-fri", hour="4-15", minute="*/5", timezone=NY),
         id="market_scan",
+        max_instances=1,
+        coalesce=True,
+    )
+    # One after-hours scan at 16:00 NY.
+    scheduler.add_job(
+        run_market_pipeline,
+        CronTrigger(day_of_week="mon-fri", hour="16", minute="0", timezone=NY),
+        id="after_hours_scan",
         max_instances=1,
         coalesce=True,
     )
