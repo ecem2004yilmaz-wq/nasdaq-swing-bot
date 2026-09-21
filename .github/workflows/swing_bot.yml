@@ -1,21 +1,18 @@
-name: NASDAQ NYSE Swing Bot
+name: NASDAQ Swing Bot
 
 on:
   schedule:
-    # New York time: 04:00-16:00, Monday-Friday, every 5 minutes.
-    # 04:00-09:25 = pre-market, 09:30-16:00 = regular session.
-    - cron: "*/5 4-15 * * 1-5"
-      timezone: "America/New_York"
-    - cron: "0 16 * * 1-5"
-      timezone: "America/New_York"
+    # GitHub Actions uses UTC. 08:00–21:55 UTC covers both EST/EDT;
+    # the Python bot itself checks America/New_York market hours.
+    - cron: "*/5 8-21 * * 1-5"
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: swing-bot
-  cancel-in-progress: true
+  group: nasdaq-swing-bot
+  cancel-in-progress: false
 
 jobs:
   scan:
@@ -24,48 +21,35 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
+        uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v6
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt
 
-      - name: Run one swing scan
+      - name: Run one market scan
         env:
           GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DATABASE_PATH: alerts.db
           TICKER_CACHE_FILE: nasdaq_tickers.json
-        run: |
-          python main.py --once
+        run: python main.py --once
 
-      - name: Persist bot state
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # The scan changes alerts.db, so commit local changes BEFORE pulling.
-          # Pulling with unstaged SQLite changes caused the previous workflow failure.
-          git add alerts.db
-          if [ -f nasdaq_tickers.json ]; then
-            git add nasdaq_tickers.json
-          fi
-
-          if git diff --cached --quiet; then
-            echo "No bot state changes to commit."
-            exit 0
-          fi
-
-          git commit -m "Update bot state"
-          git pull --rebase origin main
-          git push origin main
+      - name: Upload bot state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-state-${{ github.run_id }}
+          path: |
+            alerts.db
+            nasdaq_tickers.json
+          if-no-files-found: ignore
+          retention-days: 7
