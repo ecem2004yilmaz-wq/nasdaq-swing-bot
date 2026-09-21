@@ -59,20 +59,26 @@ SIGNAL_COOLDOWN_MINUTES = 30
 MAX_DAILY_GAIN_LONG = 25.0
 MIN_RSI_LONG = 45.0
 MAX_RSI_LONG = 78.0
+# A repeat signal during cooldown is allowed only when the setup has materially
+# improved, not merely because price moved 3%.
 COOLDOWN_SCORE_OVERRIDE = 10
-COOLDOWN_RVOL_OVERRIDE = 1.5
-COOLDOWN_MOVE_OVERRIDE = 0.03
+COOLDOWN_RVOL_OVERRIDE = 0.75
+COOLDOWN_M15_OVERRIDE = 5.0
+COOLDOWN_M5_ACCEL_OVERRIDE = 3.0
 MAX_SIGNAL_DAYS = 10
 NORMAL_EXPECTED_DAYS = "1–3 gün"
 
 # API / scan controls
 SCREENER_COUNT = 500
-QUOTE_BATCH_SIZE = 100
-DETAILED_CANDIDATES = 350
-MAX_WORKERS = 16
-YAHOO_TIMEOUT = 10
+SPARK_BATCH_SIZE = 50
+SPARK_SYMBOLS_PER_SCAN = 500
+SPARK_MIN_PAUSE = 0.35
+DETAILED_CANDIDATES = 100
+MAX_WORKERS = 8
+YAHOO_TIMEOUT = 12
 YAHOO_RETRIES = 2
-YAHOO_BASE_BACKOFF = 1.2
+YAHOO_BASE_BACKOFF = 1.5
+YAHOO_429_COOLDOWN = 30
 MAX_GEMINI_DAILY_REQUESTS = 1400
 SCAN_INTERVAL_MINUTES = 5
 
@@ -82,7 +88,19 @@ TR = ZoneInfo("Europe/Istanbul")
 SEC_TICKER_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
 YAHOO_SCREENER_URL = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
 YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
+YAHOO_SPARK_URL = "https://query1.finance.yahoo.com/v7/finance/spark"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+NASDAQ_MOVERS_URL = "https://api.nasdaq.com/api/marketmovers"
+ENABLE_YAHOO_DIRECT_QUOTES = False
+# Keep Yahoo's private/crumb-protected screener and quote APIs disabled.
+# Discovery uses Nasdaq movers + a throttled, rotating Spark scan.
+ENABLE_YAHOO_SPARK_SCAN = True
+ENABLE_YAHOO_SCREENERS = False
+YAHOO_CRUMB = None
+YAHOO_CRUMB_LOCK = threading.Lock()
+YAHOO_HTTP_SEMAPHORE = threading.BoundedSemaphore(6)
+YAHOO_NEXT_ALLOWED_AT = 0.0
+YAHOO_RATE_LOCK = threading.Lock()
 
 # ============================================================
 # LOGGING
@@ -108,17 +126,99 @@ SESSION.headers.update({
 SCAN_LOCK = threading.Lock()
 
 
-def http_get(url, params=None, timeout=YAHOO_TIMEOUT, retries=YAHOO_RETRIES):
-    last_error = None
+def _ensure_yahoo_crumb(force=False):
+    global YAHOO_CRUMB
+    with YAHOO_CRUMB_LOCK:
+        if YAHOO_CRUMB and not force:
+            return YAHOO_CRUMB
+        try:
+            # Yahoo's v7 quote/screener endpoints currently require a cookie
+            # + crumb pair. The older unauthenticated calls return HTTP 401.
+            SESSION.get("https://fc.yahoo.com", timeout=8, allow_redirects=True)
+        except Exception:
+            pass
+        try:
+            r = SESSION.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=8, allow_redirects=True)
+            r.raise_for_status()
+            crumb = r.text.strip()
+            if crumb and "html" not in crumb.lower():
+                YAHOO_CRUMB = crumb
+                return crumb
+        except Exception as e:
+            log.warning("Yahoo crumb alınamadı: %s", e)
+        return None
+
+
+def yahoo_request(url, params=None, timeout=YAHOO_TIMEOUT, retries=YAHOO_RETRIES):
+    params = dict(params or {})
+    crumb = _ensure_yahoo_crumb()
+    if crumb:
+        params["crumb"] = crumb
     for attempt in range(retries + 1):
         try:
             r = SESSION.get(url, params=params, timeout=timeout)
+            if r.status_code == 401:
+                crumb = _ensure_yahoo_crumb(force=True)
+                if crumb:
+                    params["crumb"] = crumb
+                    r = SESSION.get(url, params=params, timeout=timeout)
             if r.status_code == 200:
                 return r
             if r.status_code in (429, 500, 502, 503, 504):
-                last_error = RuntimeError(f"HTTP {r.status_code}")
                 time.sleep(YAHOO_BASE_BACKOFF * (attempt + 1))
                 continue
+            r.raise_for_status()
+        except Exception as exc:
+            if attempt < retries:
+                time.sleep(YAHOO_BASE_BACKOFF * (attempt + 1))
+                continue
+            raise
+    raise RuntimeError("Yahoo request failed")
+
+
+def _yahoo_wait_if_rate_limited():
+    global YAHOO_NEXT_ALLOWED_AT
+    with YAHOO_RATE_LOCK:
+        wait = max(0.0, YAHOO_NEXT_ALLOWED_AT - time.monotonic())
+    if wait:
+        time.sleep(wait)
+
+
+def _yahoo_mark_rate_limited():
+    global YAHOO_NEXT_ALLOWED_AT
+    with YAHOO_RATE_LOCK:
+        YAHOO_NEXT_ALLOWED_AT = max(
+            YAHOO_NEXT_ALLOWED_AT,
+            time.monotonic() + YAHOO_429_COOLDOWN,
+        )
+
+
+def http_get(url, params=None, timeout=YAHOO_TIMEOUT, retries=YAHOO_RETRIES):
+    last_error = None
+    for attempt in range(retries + 1):
+        _yahoo_wait_if_rate_limited()
+        try:
+            with YAHOO_HTTP_SEMAPHORE:
+                r = SESSION.get(url, params=params, timeout=timeout)
+            if r.status_code == 200:
+                return r
+            if r.status_code == 429:
+                _yahoo_mark_rate_limited()
+                last_error = RuntimeError("HTTP 429")
+                if attempt < retries:
+                    time.sleep(YAHOO_BASE_BACKOFF * (attempt + 1))
+                    continue
+                break
+            if r.status_code in (500, 502, 503, 504):
+                last_error = RuntimeError(f"HTTP {r.status_code}")
+                if attempt < retries:
+                    time.sleep(YAHOO_BASE_BACKOFF * (attempt + 1))
+                    continue
+                break
+            if r.status_code == 401:
+                # Do not enter a crumb-refresh loop. The bot deliberately avoids
+                # private Yahoo endpoints; a 401 means this source is unavailable.
+                raise RuntimeError(f"HTTP 401 for {url}")
             r.raise_for_status()
         except Exception as exc:
             last_error = exc
@@ -140,6 +240,9 @@ class Database:
     def connect(self):
         conn = sqlite3.connect(self.path, timeout=30)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
     def init_db(self):
@@ -270,7 +373,7 @@ class Database:
         cutoff = datetime.now(TR) - timedelta(minutes=minutes)
         with self.connect() as c:
             row = c.execute(
-                "SELECT opened_at, score, rvol, entry_price FROM swing_signals "
+                "SELECT id, opened_at, score, rvol, entry_price FROM swing_signals "
                 "WHERE symbol=? ORDER BY id DESC LIMIT 1", (symbol,)
             ).fetchone()
         if not row:
@@ -533,14 +636,34 @@ class CandidateScanner:
         self.allowed = set(allowed_symbols)
 
     def _screener(self, scr_id):
-        params = {"scrIds": scr_id, "count": SCREENER_COUNT, "start": 0}
-        r = http_get(YAHOO_SCREENER_URL, params=params, timeout=12, retries=2)
-        data = r.json()
-        result = data.get("finance", {}).get("result") or []
-        if not result:
-            return []
-        quotes = result[0].get("quotes") or []
-        return quotes
+        params = {
+            "scrIds": scr_id,
+            "count": SCREENER_COUNT,
+            "start": 0,
+            "formatted": "false",
+            "lang": "en-US",
+            "region": "US",
+            "corsDomain": "finance.yahoo.com",
+        }
+        # Predefined screeners are also available without the crumb-protected
+        # v7 quote endpoint. Try query2 first, then query1 as fallback.
+        urls = [
+            "https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved",
+            YAHOO_SCREENER_URL,
+        ]
+        last = None
+        for url in urls:
+            try:
+                r = http_get(url, params=params, timeout=12, retries=1)
+                data = r.json()
+                result = data.get("finance", {}).get("result") or []
+                if result:
+                    return result[0].get("quotes") or []
+            except Exception as e:
+                last = e
+        if last:
+            raise last
+        return []
 
     def _merge_quote(self, q, session, merged):
         sym = str(q.get("symbol", "")).upper()
@@ -572,7 +695,7 @@ class CandidateScanner:
         else:
             change = regular_change
         dollar = price * max(volume, avg_volume * 0.15)
-        if avg_volume < MIN_AVG_DAILY_VOLUME and dollar < MIN_DOLLAR_VOLUME:
+        if avg_volume < MIN_AVG_DAILY_VOLUME and dollar < MIN_DOLLAR_VOLUME and q.get("_spark_m15") is None:
             return
         old = merged.get(sym)
         item = {
@@ -585,46 +708,242 @@ class CandidateScanner:
             "premarket_change": pre_change,
             "premarket_volume": pre_volume,
             "dollar_volume": dollar,
+            "spark_m5": safe_float(q.get("_spark_m5"), 0) or 0.0,
+            "spark_m15": safe_float(q.get("_spark_m15"), 0) or 0.0,
+            "spark_m30": safe_float(q.get("_spark_m30"), 0) or 0.0,
+            "_source": q.get("_source", "YAHOO"),
         }
         if old is None or item["change"] > old["change"] or item["volume"] > old["volume"]:
             merged[sym] = item
 
-    def _direct_quote_scan(self, session, merged):
+    def _nasdaq_market_movers(self, session, merged):
+        # Yahoo's undocumented quote/screener endpoints can return 401/400
+        # without the required session/crumb state. Do not make the whole
+        # discovery layer depend on those endpoints. Nasdaq's public market-
+        # movers feed is designed for current US market movers and exposes
+        # gainers and most-active names.
+        if session not in {"PRE_MARKET", "REGULAR", "AFTER_HOURS"}:
+            return
+        try:
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/140.0 Safari/537.36"
+                ),
+                "Accept": "application/json, text/plain, */*",
+                "Referer": "https://www.nasdaq.com/",
+                "Origin": "https://www.nasdaq.com",
+            }
+            r = SESSION.get(
+                NASDAQ_MOVERS_URL,
+                params={
+                    "assetclass": "stocks",
+                    "exchangeStatus": "currentMarket",
+                    "limit": 200,
+                    "offset": 0,
+                },
+                headers=headers,
+                timeout=12,
+            )
+            r.raise_for_status()
+            payload = r.json()
+
+            # The public endpoint has changed nesting names over time. Walk
+            # all nested lists and accept rows that look like stock-mover
+            # records instead of depending on one brittle response shape.
+            rows = []
+            def walk(obj):
+                if isinstance(obj, dict):
+                    if str(obj.get("symbol", "")).upper():
+                        rows.append(obj)
+                    for v in obj.values():
+                        walk(v)
+                elif isinstance(obj, list):
+                    for v in obj:
+                        walk(v)
+            walk(payload)
+
+            added = 0
+            seen = set()
+            for q in rows:
+                sym = str(q.get("symbol", "")).upper().strip()
+                if not sym or sym in seen or sym not in self.allowed:
+                    continue
+                seen.add(sym)
+                price = (
+                    safe_float(q.get("lastSale"))
+                    or safe_float(q.get("lastTrade"))
+                    or safe_float(q.get("lastPrice"))
+                    or safe_float(q.get("price"))
+                )
+                change = (
+                    safe_float(q.get("percentChange"))
+                    if q.get("percentChange") is not None
+                    else safe_float(q.get("percent_change"), 0)
+                ) or 0.0
+                volume = (
+                    safe_float(q.get("cummulativeVolume"))
+                    or safe_float(q.get("cumulativeVolume"))
+                    or safe_float(q.get("volume"))
+                    or 0.0
+                )
+                dollar = (
+                    safe_float(q.get("dollarAmountTraded"))
+                    or safe_float(q.get("dollarVolume"))
+                    or (price * volume if price and volume else 0.0)
+                )
+                if price is None or not (MIN_PRICE <= price <= MAX_PRICE):
+                    continue
+                if dollar < MIN_DOLLAR_VOLUME and volume <= 0:
+                    continue
+                avg_volume = 0.0
+                prev_close = price / (1.0 + change / 100.0) if change > -99.9 else 0.0
+                item = {
+                    "symbol": sym,
+                    "price": price,
+                    "volume": volume,
+                    "avg_volume": avg_volume,
+                    "change": change,
+                    "regular_change": change,
+                    "premarket_change": 0.0,
+                    "premarket_volume": 0.0,
+                    "dollar_volume": dollar,
+                    "prev_close": prev_close,
+                    "source": "NASDAQ_MARKET_MOVERS",
+                }
+                old = merged.get(sym)
+                if old is None or change > old.get("change", -999) or volume > old.get("volume", 0):
+                    merged[sym] = item
+                    added += 1
+            log.info("Nasdaq market movers: %d aday bulundu", added)
+        except Exception as e:
+            log.warning("Nasdaq market movers failed: %s", e)
+
+    def _spark_scan(self, session, merged):
+        """Throttled rotating Spark discovery.
+
+        The old implementation requested every SEC ticker every 5 minutes.
+        That produced a large number of Yahoo requests and eventually 429s.
+        We scan a bounded rotating slice instead; Nasdaq movers remain the
+        primary real-time source.
+        """
+        if not ENABLE_YAHOO_SPARK_SCAN:
+            return
+
         symbols = sorted(self.allowed)
-        for i in range(0, len(symbols), QUOTE_BATCH_SIZE):
-            batch = symbols[i:i + QUOTE_BATCH_SIZE]
+        if not symbols:
+            return
+
+        # Rotate by 5-minute bucket. This keeps the scan broad over time while
+        # avoiding a burst against Yahoo on every scheduler tick.
+        chunks = max(1, (len(symbols) + SPARK_SYMBOLS_PER_SCAN - 1) // SPARK_SYMBOLS_PER_SCAN)
+        bucket = int(time.time() // (SCAN_INTERVAL_MINUTES * 60))
+        chunk_index = bucket % chunks
+        start = chunk_index * SPARK_SYMBOLS_PER_SCAN
+        selected = symbols[start:start + SPARK_SYMBOLS_PER_SCAN]
+
+        added = 0
+        for i in range(0, len(selected), SPARK_BATCH_SIZE):
+            batch = selected[i:i + SPARK_BATCH_SIZE]
             try:
                 r = http_get(
-                    YAHOO_QUOTE_URL,
-                    params={"symbols": ",".join(batch)},
-                    timeout=12,
+                    YAHOO_SPARK_URL,
+                    params={
+                        "symbols": ",".join(batch),
+                        "range": "1d",
+                        "interval": "5m",
+                        "includePrePost": "true",
+                    },
+                    timeout=15,
                     retries=1,
                 )
                 data = r.json()
-                quotes = ((data.get("quoteResponse") or {}).get("result") or [])
-                for q in quotes:
-                    self._merge_quote(q, session, merged)
+                results = ((data.get("spark") or {}).get("result") or [])
+                for item in results:
+                    sym = str(item.get("symbol", "")).upper()
+                    if sym not in self.allowed:
+                        continue
+                    resp = item.get("response") or {}
+                    meta = resp.get("meta") or {}
+                    closes = ((resp.get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
+                    closes = [safe_float(x) for x in closes if safe_float(x) is not None]
+                    if not closes:
+                        continue
+                    price = closes[-1]
+                    if not (MIN_PRICE <= price <= MAX_PRICE):
+                        continue
+                    prev = safe_float(meta.get("chartPreviousClose")) or safe_float(meta.get("previousClose"))
+                    if not prev or prev <= 0:
+                        continue
+
+                    change = (price / prev - 1.0) * 100.0
+                    m5 = (price / closes[-2] - 1.0) * 100.0 if len(closes) >= 2 and closes[-2] else 0.0
+                    m15 = (price / closes[-4] - 1.0) * 100.0 if len(closes) >= 4 and closes[-4] else 0.0
+                    m30 = (price / closes[-7] - 1.0) * 100.0 if len(closes) >= 7 and closes[-7] else 0.0
+
+                    item_q = {
+                        "symbol": sym,
+                        "regularMarketPrice": price,
+                        "regularMarketPreviousClose": prev,
+                        "regularMarketChangePercent": change,
+                        "regularMarketVolume": 0,
+                        "averageDailyVolume3Month": 0,
+                        "preMarketPrice": 0,
+                        "postMarketPrice": 0,
+                        "preMarketVolume": 0,
+                        "preMarketChangePercent": 0,
+                        "_spark_m5": m5,
+                        "_spark_m15": m15,
+                        "_spark_m30": m30,
+                        "_spark_change": change,
+                        "_source": "SPARK",
+                    }
+                    before = sym in merged
+                    self._merge_quote(item_q, session, merged)
+                    if sym in merged:
+                        merged[sym]["spark_m5"] = m5
+                        merged[sym]["spark_m15"] = m15
+                        merged[sym]["spark_m30"] = m30
+                        merged[sym]["_source"] = merged[sym].get("_source") or "SPARK"
+                        added += 0 if before else 1
             except Exception as e:
-                log.warning("Yahoo direct quote batch %d-%d failed: %s", i, i + len(batch), e)
+                log.warning("Yahoo Spark batch %d-%d failed: %s", start + i, start + i + len(batch), e)
+                if "429" in str(e):
+                    log.warning("Yahoo 429: Spark taraması bu tur için durduruldu.")
+                    break
+            time.sleep(SPARK_MIN_PAUSE)
+
+        log.info(
+            "Yahoo Spark rotating scan: %d/%d sembol, %d yeni aday, toplam=%d",
+            len(selected), len(symbols), added, len(merged),
+        )
+
+    def _direct_quote_scan(self, session, merged):
+        # Kept as a compatibility wrapper; the old v7 quote endpoint is
+        # deliberately disabled because it is the source of the 401/429 loop.
+        if ENABLE_YAHOO_DIRECT_QUOTES:
+            self._spark_scan(session, merged)
 
     def get_active_universe(self):
         merged = {}
         session = TimezoneManager.market_session()
 
-        # PRIMARY DISCOVERY: scan the SEC universe in quote batches. This is
-        # the important change: a fast mover no longer has to appear in a
-        # Yahoo predefined screener before it can reach technical analysis.
-        self._direct_quote_scan(session, merged)
+        # PRIMARY DISCOVERY: Nasdaq market movers. This catches the names
+        # already accelerating without relying on Yahoo's private quote API.
+        self._nasdaq_market_movers(session, merged)
 
-        # SECONDARY DISCOVERY: predefined screeners add names/fields that a
-        # quote batch can occasionally miss and strengthen premarket ranking.
-        for sid in self.PREDEFINED:
-            try:
-                quotes = self._screener(sid)
-                for q in quotes:
-                    self._merge_quote(q, session, merged)
-            except Exception as e:
-                log.warning("Yahoo screener %s failed: %s", sid, e)
+        # Yahoo is a secondary broad discovery source. We use a live cookie+crumb
+        # session so the current v7 endpoint is not called anonymously.
+        self._spark_scan(session, merged)
+        if ENABLE_YAHOO_SCREENERS:
+            for sid in self.PREDEFINED:
+                try:
+                    quotes = self._screener(sid)
+                    for q in quotes:
+                        self._merge_quote(q, session, merged)
+                except Exception as e:
+                    log.warning("Yahoo screener %s failed: %s", sid, e)
 
         candidates = list(merged.values())
         # Discovery score deliberately gives pre-market movers a direct path
@@ -640,6 +959,8 @@ class CandidateScanner:
             if change >= 10: s += 10
             if change >= 25: s += 15
             if change >= 50: s += 15
+            if x.get("spark_m15", 0) >= 5: s += 8
+            if x.get("spark_m30", 0) >= 8: s += 6
             if x["volume"] >= x["avg_volume"] * 1.5 > 0: s += 10
             if x["volume"] >= x["avg_volume"] * 2.5 > 0: s += 10
             if x["dollar_volume"] >= 1_000_000: s += 10
@@ -692,6 +1013,7 @@ def analyze_swing(symbol, quote):
         d_high = [x["high"] for x in daily if x["high"] is not None]
         d_low = [x["low"] for x in daily if x["low"] is not None]
         d_vol = [x["volume"] for x in daily]
+        avg_daily_volume = sum(d_vol[-20:]) / max(1, len(d_vol[-20:]))
         price = safe_float(quote.get("price")) or d_close[-1]
         if not (MIN_PRICE <= price <= MAX_PRICE):
             return None
@@ -748,12 +1070,25 @@ def analyze_swing(symbol, quote):
 
         recent_intraday = [x for _, x in tp]
 
+        # Use only completed 5-minute candles for momentum. The latest candle
+        # can still be forming and would otherwise make 5/15/30-minute values
+        # jump around and create false "fast acceleration".
+        now_epoch = int(time.time())
+        completed_intraday = [
+            x for x in recent_intraday
+            if int(x.get("ts", 0)) <= now_epoch - (now_epoch % 300) - 1
+        ]
+        if len(completed_intraday) >= 8:
+            recent_intraday = completed_intraday
+
         # Multi-horizon momentum. Five-minute bars let us distinguish a stock
         # that may move in the next few minutes from a slower 1-3 day setup.
         m5_change = pct_change_from_bars(recent_intraday, 1)
         m15_change = pct_change_from_bars(recent_intraday, 3)
         m30_change = pct_change_from_bars(recent_intraday, 6)
         h1_change = pct_change_from_bars(recent_intraday, 12)
+        prev_m5_change = pct_change_from_bars(recent_intraday[:-1], 1) if len(recent_intraday) >= 3 else 0.0
+        m5_acceleration = m5_change - prev_m5_change
         recent_30_high = max((x["high"] for x in recent_intraday[-30:] if x.get("high") is not None), default=price)
         near_intraday_high = price >= recent_30_high * 0.985 if recent_30_high else False
 
@@ -804,11 +1139,16 @@ def analyze_swing(symbol, quote):
         if spread_pct > 0.06:
             return None
 
+        quote_volume = safe_float(quote.get("volume"), 0) or 0
+        quote_avg_volume = safe_float(quote.get("avg_volume"), 0) or 0
         dollar_volume = max(
             safe_float(quote.get("dollar_volume"), 0) or 0,
-            price * (safe_float(quote.get("volume"), 0) or 0),
+            price * quote_volume,
+            price * avg_daily_volume,
+            price * quote_avg_volume,
         )
-        if dollar_volume < MIN_DOLLAR_VOLUME and (safe_float(quote.get("avg_volume"), 0) or 0) * price < MIN_DOLLAR_VOLUME:
+        effective_avg_volume = max(avg_daily_volume, quote_avg_volume)
+        if effective_avg_volume < MIN_AVG_DAILY_VOLUME and dollar_volume < MIN_DOLLAR_VOLUME:
             return None
 
         # Hard rejects: not a clean bullish setup.
@@ -882,6 +1222,10 @@ def analyze_swing(symbol, quote):
             score += 8; reasons.append("5dk momentum +3%")
         if m5_change >= 8:
             score += 7; reasons.append("5dk momentum +8%")
+        if m5_acceleration >= 3:
+            score += 7; reasons.append("Hızlı ivme artıyor")
+        elif m5_acceleration >= 1.5:
+            score += 3; reasons.append("Kısa vadeli ivme pozitif")
         if m15_change >= 5:
             score += 8; reasons.append("15dk momentum +5%")
         if m15_change >= 12:
@@ -973,6 +1317,7 @@ def analyze_swing(symbol, quote):
             "extended_move": extended_move,
             "premarket_change": round(safe_float(quote.get("premarket_change"), 0) or 0, 2),
             "m5_change": round(m5_change, 2),
+            "m5_acceleration": round(m5_acceleration, 2),
             "m15_change": round(m15_change, 2),
             "m30_change": round(m30_change, 2),
             "h1_change": round(h1_change, 2),
@@ -1029,6 +1374,7 @@ class GeminiEvaluator:
                 "rr": c["rr"],
                 "daily_change": c["daily_change"],
                 "m5_change": c.get("m5_change", 0),
+                "m5_acceleration": c.get("m5_acceleration", 0),
                 "m15_change": c.get("m15_change", 0),
                 "m30_change": c.get("m30_change", 0),
                 "h1_change": c.get("h1_change", 0),
@@ -1041,7 +1387,7 @@ class GeminiEvaluator:
         prompt = """
 You are a neutral technical screener assisting a short-term US stock alert bot.
 Evaluate only the supplied candidates. Do not invent news or fundamentals.
-Focus on whether the supplied setup has actionable bullish momentum and which time horizon best matches the CURRENT momentum: 5-15 minutes, 15-60 minutes, 1-4 hours, today, or 1-3 days. Do not assume a stock will rise; classify the evidence only.
+Focus on whether the supplied setup has actionable bullish momentum, whether short-term acceleration is increasing, and which time horizon best matches the CURRENT momentum: 5-15 minutes, 15-60 minutes, 1-4 hours, today, or 1-3 days. Do not assume a stock will rise; classify the evidence only.
 Return ONLY valid JSON as an array. Each item must be:
 {"symbol":"XYZ","decision":"BUY|WATCH|PASS","reason":"short Turkish reason"}
 BUY = technically coherent bullish setup.
@@ -1143,6 +1489,7 @@ def build_open_message(c):
         f"⚖️ RR: {c['rr']:.2f}\n\n"
         f"⏱ Momentum ufku: {c.get('momentum_horizon', c['expected_days'])}\n"
         f"⚡ 5dk: {c.get('m5_change', 0):+.2f}% | 15dk: {c.get('m15_change', 0):+.2f}% | 30dk: {c.get('m30_change', 0):+.2f}%\n"
+        f"🚀 İvme: {c.get('m5_acceleration', 0):+.2f} puan/5dk\n"
         f"🕐 1s: {c.get('h1_change', 0):+.2f}% | Günlük: {c['daily_change']:+.2f}%\n"
         + (f"🔥 Pre-market: {c.get('premarket_change', 0):+.2f}%\n" if c.get('premarket_change', 0) else "")
         + ("⚠️ Yüksek volatilite / momentum\n" if c.get('extended_move') else "")
@@ -1229,22 +1576,34 @@ def track_open_signals():
 def cooldown_allows(symbol, candidate):
     if DB.has_open_signal(symbol):
         return False
+
     recent = DB.recent_signal(symbol)
     if not recent:
         return True
+
     old_score = safe_float(recent.get("score"), 0) or 0
     old_rvol = safe_float(recent.get("rvol"), 0) or 0
-    old_entry = safe_float(recent.get("entry_price"), 0) or 0
     new_score = candidate["score"]
     new_rvol = candidate["rvol"]
-    new_entry = candidate["entry"]
-    move = abs(new_entry - old_entry) / old_entry if old_entry else 0
-    if new_score - old_score >= COOLDOWN_SCORE_OVERRIDE:
+    new_m15 = safe_float(candidate.get("m15_change"), 0) or 0
+    new_accel = safe_float(candidate.get("m5_acceleration"), 0) or 0
+
+    score_jump = new_score - old_score
+    rvol_jump = new_rvol - old_rvol
+
+    # During cooldown, require evidence that the setup itself strengthened.
+    # A simple 3% price move was too permissive and caused duplicate alerts.
+    if score_jump >= COOLDOWN_SCORE_OVERRIDE and (
+        rvol_jump >= COOLDOWN_RVOL_OVERRIDE or new_m15 >= COOLDOWN_M15_OVERRIDE
+    ):
         return True
-    if new_rvol - old_rvol >= COOLDOWN_RVOL_OVERRIDE:
+
+    if rvol_jump >= COOLDOWN_RVOL_OVERRIDE and new_m15 >= COOLDOWN_M15_OVERRIDE:
         return True
-    if move >= COOLDOWN_MOVE_OVERRIDE:
+
+    if new_accel >= COOLDOWN_M5_ACCEL_OVERRIDE and new_m15 >= COOLDOWN_M15_OVERRIDE:
         return True
+
     return False
 
 
@@ -1268,9 +1627,11 @@ def run_market_pipeline():
         scanner = CandidateScanner(allowed)
         quick = scanner.get_active_universe()
         if not quick:
-            log.info("Broad screener bu tur aday döndürmedi.")
+            log.warning("Broad discovery bu turda aday döndürmedi; yeni aday taraması yok.")
             return
 
+        # Keep the candidate funnel broad enough that a newly accelerating
+        # low-priced stock is not discarded before technical analysis.
         quick = quick[:DETAILED_CANDIDATES]
         results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -1284,7 +1645,11 @@ def run_market_pipeline():
                     pass
 
         if not results:
-            log.info("Detaylı teknik taramada uygun aday çıkmadı.")
+            log.info(
+                "Detaylı teknik taramada uygun aday çıkmadı | quick=%d | "
+                "Muhtemel neden: likidite/RVOL/RSI/score filtreleri.",
+                len(quick),
+            )
             return
 
         # Prioritize fresh, short-horizon momentum instead of letting a slower
@@ -1325,6 +1690,7 @@ def run_market_pipeline():
                     and c["volume_increasing"]
                     and (c["breakout"] or c["near_resistance"] or c.get("near_intraday_high"))
                     and c.get("m15_change", 0) >= 8.0
+                    and c.get("m5_acceleration", 0) >= 0
                 )
                 weak_setup = (
                     (c["score"] < MOMENTUM_SCORE and not strong_explosive)
@@ -1337,8 +1703,8 @@ def run_market_pipeline():
             c["gemini_reason"] = g.get("reason", "")[:300]
             msg = build_open_message(c)
             if send_telegram_message(msg):
-                DB.create_signal(c)
-                DB.add_update(DB.get_open_signals()[-1]["id"], "OPEN", c["entry"], "Yeni sinyal açıldı.")
+                signal_id = DB.create_signal(c)
+                DB.add_update(signal_id, "OPEN", c["entry"], "Yeni sinyal açıldı.")
                 sent += 1
                 if sent >= 5:
                     break
@@ -1362,16 +1728,8 @@ def run_daemon():
     # Premarket + regular market: every 5 minutes.
     scheduler.add_job(
         run_market_pipeline,
-        CronTrigger(day_of_week="mon-fri", hour="4-15", minute="*/5", timezone=NY),
+        CronTrigger(day_of_week="mon-fri", hour="4-20", minute="*/5", timezone=NY),
         id="market_scan",
-        max_instances=1,
-        coalesce=True,
-    )
-    # One after-hours scan at 16:00 NY.
-    scheduler.add_job(
-        run_market_pipeline,
-        CronTrigger(day_of_week="mon-fri", hour="16", minute="0", timezone=NY),
-        id="after_hours_scan",
         max_instances=1,
         coalesce=True,
     )
